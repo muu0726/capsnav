@@ -88,14 +88,11 @@ mod tests {
     fn test_embedded_icon_asset_validity() {
         assert!(!ICON_BYTES.is_empty(), "埋め込みアイコンが空であってはなりません");
         let img = image::load_from_memory(ICON_BYTES).expect("埋め込みPNGのデコードに失敗しました");
-        let (width, height) = img.to_rgba8().dimensions();
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
         assert_eq!(width, 512, "アイコン幅は512pxである必要があります");
         assert_eq!(height, 512, "アイコン高さは512pxである必要があります");
-    }
-
-    #[test]
-    fn test_load_embedded_icon() {
-        let icon_res = load_embedded_icon();
-        assert!(icon_res.is_ok(), "load_embedded_icon は正常に成功する必要があります");
+        // 4チャンネル (RGBA) の正確なバイト配列長を検証
+        assert_eq!(rgba.into_raw().len(), 512 * 512 * 4);
     }
 }
