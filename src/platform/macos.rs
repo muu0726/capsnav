@@ -1,23 +1,17 @@
-//! macOS プラットフォーム向けキーフック実装 (CGEventTap + Accessibility)
+//! macOS プラットフォーム向けキーフック実装 (CoreGraphics EventTap + CoreFoundation)
 
+use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use core_foundation::base::TCFType;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop, CFRunLoopRef};
-use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-    CGEventTapPlacement, CGEventType, EventField,
-};
 
-use crate::common::INJECTED_SIGNATURE;
+pub type CGEventRef = *mut c_void;
+pub type CGEventTapProxy = *mut c_void;
+pub type CFMachPortRef = *mut c_void;
+pub type CFRunLoopRef = *mut c_void;
+pub type CFRunLoopSourceRef = *mut c_void;
+pub type CFAllocatorRef = *mut c_void;
+pub type CFStringRef = *mut c_void;
 
-/// CapsLockが物理的に押下されているかどうかの状態フラグ
-static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
-
-/// 実行中のCFRunLoopポインタ（シグナルによる安全停止用）
-static RUN_LOOP_PTR: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
-
-// macOS Virtual Key Code 定義
 pub const KEY_CAPSLOCK: i64 = 57;
 pub const KEY_I: i64 = 34;
 pub const KEY_J: i64 = 38;
@@ -29,17 +23,56 @@ pub const KEY_ARROW_LEFT: u16 = 123;
 pub const KEY_ARROW_DOWN: u16 = 125;
 pub const KEY_ARROW_RIGHT: u16 = 124;
 
-const HID_SYSTEM_STATE: i32 = 1;
+pub const K_CG_EVENT_KEY_DOWN: u32 = 10;
+pub const K_CG_EVENT_KEY_UP: u32 = 11;
+pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
+
+pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+pub const K_CG_EVENT_SOURCE_USER_DATA: u32 = 42;
+
+pub const K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 0x00010000;
+
+pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+pub const K_CG_SESSION_EVENT_TAP: u32 = 1;
+pub const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
+
+static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
+static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[link(name = "ApplicationServices", kind = "framework")]
+#[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn CGEventSourceKeyState(state: i32, keycode: u16) -> bool;
-    fn CGEventPost(tap: u32, event: core_graphics::sys::CGEventRef);
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: unsafe extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef,
+        refcon: *mut c_void,
+    ) -> CFMachPortRef;
+    fn CFMachPortCreateRunLoopSource(
+        allocator: CFAllocatorRef,
+        port: CFMachPortRef,
+        order: isize,
+    ) -> CFRunLoopSourceRef;
+    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRun();
     fn CFRunLoopStop(rl: CFRunLoopRef);
+    fn CFRelease(cf: *const c_void);
+
+    fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
+    fn CGEventCreateKeyboardEvent(source: *mut c_void, virtual_key: u16, key_down: bool) -> CGEventRef;
+    fn CGEventPost(tap: u32, event: CGEventRef);
+
+    static kCFRunLoopCommonModes: CFStringRef;
 }
 
-/// macOSのキーコードを対応する矢印キーコードに変換する純粋関数
 pub fn macos_keycode_to_arrow(keycode: i64) -> Option<u16> {
     match keycode {
         KEY_I => Some(KEY_ARROW_UP),
@@ -50,73 +83,68 @@ pub fn macos_keycode_to_arrow(keycode: i64) -> Option<u16> {
     }
 }
 
-/// アクセシビリティ権限が付与されているかを検査
 pub fn check_accessibility() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
-/// CoreGraphics イベントタップコールバック
-fn event_tap_callback(
-    _proxy: core_graphics::event::CGEventTapProxy,
-    event_type: CGEventType,
-    event: &CGEvent,
-) -> Option<CGEvent> {
-    // 1. 自身がシミュレート送信したイベントの場合は即座に通過（無限ループ防止）
-    let user_data = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
-    if user_data == INJECTED_SIGNATURE as i64 {
-        return Some(event.clone());
+unsafe extern "C" fn event_tap_callback(
+    _proxy: CGEventTapProxy,
+    event_type: u32,
+    event: CGEventRef,
+    _refcon: *mut c_void,
+) -> CGEventRef {
+    if event.is_null() {
+        return event;
     }
 
-    // 2. キー変換が無効化（Enabled = false）されている場合はすべて通常通過
+    // 1. ループ防止
+    let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
+    if user_data == crate::common::INJECTED_SIGNATURE as i64 {
+        return event;
+    }
+
+    // 2. 有効/無効判定
     if !crate::common::is_enabled() {
-        return Some(event.clone());
+        return event;
     }
 
-    // 3. CapsLock状態変化の捕捉（OSのトグル動作およびLED点灯を完全に破棄）
-    if event_type == CGEventType::FlagsChanged {
-        let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+    // 3. CapsLock 状態変化の捕捉
+    if event_type == K_CG_EVENT_FLAGS_CHANGED {
+        let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
         if keycode == KEY_CAPSLOCK {
-            let is_down = unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, KEY_CAPSLOCK as u16) };
+            let is_down = CGEventSourceKeyState(1, KEY_CAPSLOCK as u16);
             CAPS_PRESSED.store(is_down, Ordering::SeqCst);
-            // None を返すことで、OSおよび他アプリへの伝播を完全に遮断
-            return None;
+            return ptr::null_mut(); // Suppress event!
         }
     }
 
-    // 3. CapsLock押下中における I/J/K/L 矢印キー変換
+    // 4. CapsLock押下中における I/J/K/L 矢印キー変換
     if CAPS_PRESSED.load(Ordering::SeqCst) {
-        if event_type == CGEventType::KeyDown || event_type == CGEventType::KeyUp {
-            let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+        if event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP {
+            let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
             if let Some(target_arrow) = macos_keycode_to_arrow(keycode) {
-                let is_down = event_type == CGEventType::KeyDown;
-                if let Ok(new_event) = CGEvent::new_keyboard_event(ptr::null_mut(), target_arrow, is_down) {
-                    // 修飾キー（Shift, Cmd, Option, Ctrl）を保持し、CapsLockフラグのみ除去
-                    let mut flags = event.get_flags();
-                    flags.remove(CGEventFlags::CGEventFlagAlphaShift);
-                    new_event.set_flags(flags);
-
-                    // ループ防止用タグをセット
-                    new_event.set_integer_value_field(
-                        EventField::EVENT_SOURCE_USER_DATA,
-                        INJECTED_SIGNATURE as i64,
+                let is_down = event_type == K_CG_EVENT_KEY_DOWN;
+                let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
+                if !new_event.is_null() {
+                    let flags = CGEventGetFlags(event) & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT;
+                    CGEventSetFlags(new_event, flags);
+                    CGEventSetIntegerValueField(
+                        new_event,
+                        K_CG_EVENT_SOURCE_USER_DATA,
+                        crate::common::INJECTED_SIGNATURE as i64,
                     );
-
-                    // kCGHIDEventTap (0) に向けてイベントを注入
-                    unsafe { CGEventPost(0, new_event.as_concrete_TypeRef()) };
+                    CGEventPost(0, new_event); // kCGHIDEventTap
+                    CFRelease(new_event);
                 }
-                // 元の I/J/K/L イベントを破棄
-                return None;
+                return ptr::null_mut(); // Suppress original IJKL key!
             }
-            // I/J/K/L 以外のキーはそのまま通過
         }
     }
 
-    Some(event.clone())
+    event
 }
 
-/// macOS イベントタップループの実行
 pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
-    // 起動時にアクセシビリティ権限を検査
     if !check_accessibility() {
         eprintln!("\n=======================================================");
         eprintln!("[capsnav] エラー: macOSのアクセシビリティ権限が必要です。");
@@ -129,37 +157,49 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let tap = CGEventTap::new(
-        CGEventTapLocation::Session,
-        CGEventTapPlacement::HeadInsert,
-        CGEventTapOptions::Default,
-        vec![
-            CGEventType::KeyDown,
-            CGEventType::KeyUp,
-            CGEventType::FlagsChanged,
-        ],
-        event_tap_callback,
-    )?;
+    unsafe {
+        let event_mask = (1u64 << K_CG_EVENT_KEY_DOWN)
+            | (1u64 << K_CG_EVENT_KEY_UP)
+            | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
-    let loop_source = tap.mach_port.create_runloop_source(0)?;
-    let current_loop = CFRunLoop::get_current();
-    current_loop.add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+        let port = CGEventTapCreate(
+            K_CG_SESSION_EVENT_TAP,
+            K_CG_HEAD_INSERT_EVENT_TAP,
+            K_CG_EVENT_TAP_OPTION_DEFAULT,
+            event_mask,
+            event_tap_callback,
+            ptr::null_mut(),
+        );
 
-    RUN_LOOP_PTR.store(current_loop.as_concrete_TypeRef() as _, Ordering::SeqCst);
+        if port.is_null() {
+            return Err("CGEventTapCreate の呼び出しに失敗しました。アクセシビリティ権限を確認してください。".into());
+        }
 
-    log::info!("macOS CGEventTap を開始しました (CapsLock + IJKL -> 矢印)");
-    CFRunLoop::run_current();
+        let run_loop_source = CFMachPortCreateRunLoopSource(ptr::null_mut(), port, 0);
+        if run_loop_source.is_null() {
+            CFRelease(port);
+            return Err("CFMachPortCreateRunLoopSource の作成に失敗しました。".into());
+        }
 
-    log::info!("macOS イベントループを終了しました。");
+        let current_run_loop = CFRunLoopGetCurrent();
+        RUN_LOOP_PTR.store(current_run_loop, Ordering::SeqCst);
+
+        CFRunLoopAddSource(current_run_loop, run_loop_source, kCFRunLoopCommonModes);
+        log::info!("macOS CGEventTap を開始しました (CapsLock + IJKL -> 矢印)");
+        CFRunLoopRun();
+
+        CFRelease(run_loop_source);
+        CFRelease(port);
+    }
+
     Ok(())
 }
 
-/// シグナルハンドラ等からRunLoopを安全に停止
 pub fn stop_hook() {
     let loop_ptr = RUN_LOOP_PTR.load(Ordering::SeqCst);
     if !loop_ptr.is_null() {
         unsafe {
-            CFRunLoopStop(loop_ptr as _);
+            CFRunLoopStop(loop_ptr);
         }
     }
 }
@@ -175,8 +215,7 @@ mod tests {
         assert_eq!(macos_keycode_to_arrow(KEY_K), Some(KEY_ARROW_DOWN));
         assert_eq!(macos_keycode_to_arrow(KEY_L), Some(KEY_ARROW_RIGHT));
 
-        // その他のキー
-        assert_eq!(macos_keycode_to_arrow(0), None);  // 'A'
-        assert_eq!(macos_keycode_to_arrow(49), None); // Space
+        assert_eq!(macos_keycode_to_arrow(0), None);
+        assert_eq!(macos_keycode_to_arrow(49), None);
     }
 }

@@ -28,16 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-    // 2. Tao イベントループの初期化 (macOSでは Dock アイコンを出さない Accessory モードに設定)
-    #[cfg(target_os = "macos")]
-    let event_loop = {
-        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-        let mut builder = EventLoopBuilder::<UserEvent>::with_user_event();
-        builder.set_activation_policy(ActivationPolicy::Accessory);
-        builder.build()
-    };
-
-    #[cfg(not(target_os = "macos"))]
+    // 2. Tao イベントループの初期化
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     // 3. メニューイベントを Tao のイベントループへ橋渡しするプロキシ
