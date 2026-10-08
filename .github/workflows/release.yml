@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Prepare Windows artifact
+        shell: bash
+        run: |
+          cp target/x86_64-pc-windows-msvc/release/capsnav.exe capsnav-windows-x86_64.exe
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capsnav-windows-x86_64
+          path: capsnav-windows-x86_64.exe
+
+  build-macos:
+    name: Build macOS Universal Binary
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build release binary for Apple Silicon (aarch64)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Build release binary for Intel (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create Universal Binary with lipo
+        run: |
+          lipo -create -output capsnav-macos-universal \
+            target/aarch64-apple-darwin/release/capsnav \
+            target/x86_64-apple-darwin/release/capsnav
+          chmod +x capsnav-macos-universal
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capsnav-macos-universal
+          path: capsnav-macos-universal
+
+  release:
+    name: Create GitHub Release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: capsnav-windows-x86_64
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: capsnav-macos-universal
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            capsnav-windows-x86_64.exe
+            capsnav-macos-universal
+          generate_release_notes: true
