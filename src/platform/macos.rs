@@ -87,6 +87,13 @@ pub fn check_accessibility() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+/// macOS「システム設定 > プライバシーとセキュリティ > アクセシビリティ」画面を自動オープン
+pub fn open_accessibility_settings() {
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .spawn();
+}
+
 unsafe extern "C" fn event_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: u32,
@@ -146,12 +153,13 @@ unsafe extern "C" fn event_tap_callback(
 
 pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
     if !check_accessibility() {
+        // 設定画面を自動で開いてユーザーを誘導
+        open_accessibility_settings();
+
         eprintln!("\n=======================================================");
         eprintln!("[capsnav] エラー: macOSのアクセシビリティ権限が必要です。");
-        eprintln!("以下の手順で権限を付与してください:");
-        eprintln!(" 1. 「システム設定」を開く");
-        eprintln!(" 2. 「プライバシーとセキュリティ」 > 「アクセシビリティ」を開く");
-        eprintln!(" 3. ターミナル（または capsnav）のアクセスを許可する");
+        eprintln!("「システム設定 > プライバシーとセキュリティ > アクセシビリティ」を自動で開きました。");
+        eprintln!("リスト内の capsnav（またはターミナル）をオンにしてください。");
         eprintln!("許可後、再度 capsnav を実行してください。");
         eprintln!("=======================================================\n");
         std::process::exit(1);
