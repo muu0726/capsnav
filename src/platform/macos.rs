@@ -40,7 +40,6 @@ static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
 static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[link(name = "ApplicationServices", kind = "framework")]
-#[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn CGEventSourceKeyState(state: i32, keycode: u16) -> bool;
@@ -126,25 +125,25 @@ unsafe extern "C" fn event_tap_callback(
     }
 
     // 4. CapsLock押下中における I/J/K/L 矢印キー変換
-    if CAPS_PRESSED.load(Ordering::SeqCst) {
-        if event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP {
-            let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
-            if let Some(target_arrow) = macos_keycode_to_arrow(keycode) {
-                let is_down = event_type == K_CG_EVENT_KEY_DOWN;
-                let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
-                if !new_event.is_null() {
-                    let flags = CGEventGetFlags(event) & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT;
-                    CGEventSetFlags(new_event, flags);
-                    CGEventSetIntegerValueField(
-                        new_event,
-                        K_CG_EVENT_SOURCE_USER_DATA,
-                        crate::common::INJECTED_SIGNATURE as i64,
-                    );
-                    CGEventPost(0, new_event); // kCGHIDEventTap
-                    CFRelease(new_event);
-                }
-                return ptr::null_mut(); // Suppress original IJKL key!
+    if CAPS_PRESSED.load(Ordering::SeqCst)
+        && (event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP)
+    {
+        let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
+        if let Some(target_arrow) = macos_keycode_to_arrow(keycode) {
+            let is_down = event_type == K_CG_EVENT_KEY_DOWN;
+            let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
+            if !new_event.is_null() {
+                let flags = CGEventGetFlags(event) & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT;
+                CGEventSetFlags(new_event, flags);
+                CGEventSetIntegerValueField(
+                    new_event,
+                    K_CG_EVENT_SOURCE_USER_DATA,
+                    crate::common::INJECTED_SIGNATURE as i64,
+                );
+                CGEventPost(0, new_event); // kCGHIDEventTap
+                CFRelease(new_event);
             }
+            return ptr::null_mut(); // Suppress original IJKL key!
         }
     }
 
@@ -222,8 +221,32 @@ mod tests {
         assert_eq!(macos_keycode_to_arrow(KEY_J), Some(KEY_ARROW_LEFT));
         assert_eq!(macos_keycode_to_arrow(KEY_K), Some(KEY_ARROW_DOWN));
         assert_eq!(macos_keycode_to_arrow(KEY_L), Some(KEY_ARROW_RIGHT));
+    }
 
+    #[test]
+    fn test_macos_keycode_to_arrow_boundaries() {
         assert_eq!(macos_keycode_to_arrow(0), None);
-        assert_eq!(macos_keycode_to_arrow(49), None);
+        assert_eq!(macos_keycode_to_arrow(KEY_CAPSLOCK), None);
+        assert_eq!(macos_keycode_to_arrow(49), None); // Space
+        assert_eq!(macos_keycode_to_arrow(36), None); // Return
+        assert_eq!(macos_keycode_to_arrow(53), None); // ESC
+        assert_eq!(macos_keycode_to_arrow(-1), None);
+        assert_eq!(macos_keycode_to_arrow(9999), None);
+    }
+
+    #[test]
+    fn test_direction_consistency_with_common() {
+        use crate::common::{map_char_to_direction, Direction};
+        assert_eq!(map_char_to_direction('I'), Some(Direction::Up));
+        assert_eq!(macos_keycode_to_arrow(KEY_I), Some(KEY_ARROW_UP));
+
+        assert_eq!(map_char_to_direction('J'), Some(Direction::Left));
+        assert_eq!(macos_keycode_to_arrow(KEY_J), Some(KEY_ARROW_LEFT));
+
+        assert_eq!(map_char_to_direction('K'), Some(Direction::Down));
+        assert_eq!(macos_keycode_to_arrow(KEY_K), Some(KEY_ARROW_DOWN));
+
+        assert_eq!(map_char_to_direction('L'), Some(Direction::Right));
+        assert_eq!(macos_keycode_to_arrow(KEY_L), Some(KEY_ARROW_RIGHT));
     }
 }
