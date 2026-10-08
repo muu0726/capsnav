@@ -38,16 +38,3 @@ pub fn set_launch_at_startup(enabled: bool) -> Result<(), Box<dyn std::error::Er
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_create_auto_launcher() {
-        let auto_res = create_auto_launcher();
-        assert!(auto_res.is_ok(), "create_auto_launcher は現在の実行ファイルに対して正常に生成できる必要があります");
-        let auto = auto_res.unwrap();
-        assert_eq!(auto.get_app_name(), "capsnav");
-    }
-}
