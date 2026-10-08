@@ -67,7 +67,12 @@ fn event_tap_callback(
         return Some(event.clone());
     }
 
-    // 2. CapsLock状態変化の捕捉（OSのトグル動作およびLED点灯を完全に破棄）
+    // 2. キー変換が無効化（Enabled = false）されている場合はすべて通常通過
+    if !crate::common::is_enabled() {
+        return Some(event.clone());
+    }
+
+    // 3. CapsLock状態変化の捕捉（OSのトグル動作およびLED点灯を完全に破棄）
     if event_type == CGEventType::FlagsChanged {
         let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
         if keycode == KEY_CAPSLOCK {

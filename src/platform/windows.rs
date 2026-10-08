@@ -56,11 +56,16 @@ unsafe extern "system" fn low_level_keyboard_proc(
             return CallNextHookEx(None, n_code, w_param, l_param);
         }
 
+        // 2. キー変換が無効化（Enabled = false）されている場合はすべて通常通過
+        if !crate::common::is_enabled() {
+            return CallNextHookEx(None, n_code, w_param, l_param);
+        }
+
         let msg_type = w_param.0 as u32;
         let is_down = msg_type == WM_KEYDOWN || msg_type == WM_SYSKEYDOWN;
         let is_up = msg_type == WM_KEYUP || msg_type == WM_SYSKEYUP;
 
-        // 2. CapsLockの捕捉と完全遮断（OSの大文字トグル / LED点灯を完全に防止）
+        // 3. CapsLockの捕捉と完全遮断（OSの大文字トグル / LED点灯を完全に防止）
         if kbd.vkCode == VK_CAPITAL.0 as u32 {
             if is_down {
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
