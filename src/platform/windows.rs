@@ -180,9 +180,32 @@ mod tests {
         assert_eq!(vk_to_arrow(VK_J), Some(VK_LEFT));
         assert_eq!(vk_to_arrow(VK_K), Some(VK_DOWN));
         assert_eq!(vk_to_arrow(VK_L), Some(VK_RIGHT));
+    }
 
-        // その他のキーは None
-        assert_eq!(vk_to_arrow(0x41), None); // 'A'
+    #[test]
+    fn test_vk_to_arrow_boundaries() {
+        assert_eq!(vk_to_arrow(0), None);
+        assert_eq!(vk_to_arrow(0xFF), None);
+        assert_eq!(vk_to_arrow(VK_CAPITAL.0 as u32), None);
         assert_eq!(vk_to_arrow(0x20), None); // Space
+        assert_eq!(vk_to_arrow(0x0D), None); // Enter
+        assert_eq!(vk_to_arrow(0x1B), None); // ESC
+        assert_eq!(vk_to_arrow(0x30), None); // '0'
+    }
+
+    #[test]
+    fn test_direction_consistency_with_common() {
+        use crate::common::{map_char_to_direction, Direction};
+        assert_eq!(map_char_to_direction('I'), Some(Direction::Up));
+        assert_eq!(vk_to_arrow(VK_I), Some(VK_UP));
+
+        assert_eq!(map_char_to_direction('J'), Some(Direction::Left));
+        assert_eq!(vk_to_arrow(VK_J), Some(VK_LEFT));
+
+        assert_eq!(map_char_to_direction('K'), Some(Direction::Down));
+        assert_eq!(vk_to_arrow(VK_K), Some(VK_DOWN));
+
+        assert_eq!(map_char_to_direction('L'), Some(Direction::Right));
+        assert_eq!(vk_to_arrow(VK_L), Some(VK_RIGHT));
     }
 }
