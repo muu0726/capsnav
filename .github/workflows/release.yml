@@ -21,6 +21,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Run unit tests
+        run: cargo test --verbose --target x86_64-pc-windows-msvc
+
       - name: Build release binary
         run: cargo build --release --target x86_64-pc-windows-msvc
 
@@ -46,6 +49,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Run unit tests
+        run: cargo test --verbose
 
       - name: Build release binary for Apple Silicon (aarch64)
         run: cargo build --release --target aarch64-apple-darwin
