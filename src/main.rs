@@ -1,6 +1,7 @@
 // Windowsでリリースビルド時にコンソール画面を非表示にする
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autolaunch;
 mod common;
 mod platform;
 mod tray;
@@ -66,6 +67,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "capsnav (Paused)"
                 };
                 tray_components.status_item.set_text(new_status);
+            } else if menu_event.id == tray_components.launch_at_startup_item.id() {
+                let is_checked = tray_components.launch_at_startup_item.is_checked();
+                if let Err(e) = autolaunch::set_launch_at_startup(is_checked) {
+                    log::error!("自動起動設定の変更に失敗しました: {}", e);
+                    // 失敗時はUIのチェック状態をロールバック
+                    tray_components.launch_at_startup_item.set_checked(!is_checked);
+                }
             } else if menu_event.id == tray_components.quit_item.id() {
                 log::info!("Quit が選択されました。フックを停止して終了します...");
                 platform::stop_hook();

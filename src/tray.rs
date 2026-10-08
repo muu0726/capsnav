@@ -13,6 +13,7 @@ pub struct TrayComponents {
     pub _tray_icon: TrayIcon,
     pub status_item: MenuItem,
     pub enabled_item: CheckMenuItem,
+    pub launch_at_startup_item: CheckMenuItem,
     pub quit_item: MenuItem,
 }
 
@@ -40,16 +41,26 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
     // 3. Enabled トグル項目（チェックマーク付き）
     let enabled_item = CheckMenuItem::new("Enabled", true, true, None);
 
-    // 4. セパレータ
+    // 4. Launch at Startup トグル項目（現在のOS登録状態を初期値として反映）
+    let initial_startup = crate::autolaunch::is_launch_at_startup_enabled();
+    let launch_at_startup_item = CheckMenuItem::new(
+        "Launch at Startup",
+        true,
+        initial_startup,
+        None,
+    );
+
+    // 5. セパレータ
     let sep2 = PredefinedMenuItem::separator();
 
-    // 5. Quit capsnav 項目
+    // 6. Quit capsnav 項目
     let quit_item = MenuItem::new("Quit capsnav", true, None);
 
     menu.append_items(&[
         &status_item,
         &sep1,
         &enabled_item,
+        &launch_at_startup_item,
         &sep2,
         &quit_item,
     ])?;
@@ -64,6 +75,7 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
         _tray_icon: tray_icon,
         status_item,
         enabled_item,
+        launch_at_startup_item,
         quit_item,
     })
 }
