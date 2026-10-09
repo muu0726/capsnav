@@ -73,7 +73,10 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "macos")]
     {
-        builder = builder.with_icon_as_template(true);
+        #[allow(deprecated)]
+        {
+            builder = builder.with_icon_as_template(true);
+        }
     }
 
     let tray_icon = builder.build()?;
