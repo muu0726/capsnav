@@ -60,13 +60,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 common::set_enabled(is_checked);
                 log::info!("キー変換有効状態を変更しました: {}", is_checked);
 
-                // ステータス表示の更新
-                let new_status = if is_checked {
-                    "capsnav (Running)"
+                // ステータス表示およびトグルメニューテキストの更新
+                let (new_status, toggle_label) = if is_checked {
+                    ("capsnav (稼働中)", "有効")
                 } else {
-                    "capsnav (Paused)"
+                    ("capsnav (一時停止)", "一時停止")
                 };
                 tray_components.status_item.set_text(new_status);
+                tray_components.enabled_item.set_text(toggle_label);
             } else if menu_event.id == tray_components.launch_at_startup_item.id() {
                 let is_checked = tray_components.launch_at_startup_item.is_checked();
                 if let Err(e) = autolaunch::set_launch_at_startup(is_checked) {
@@ -75,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tray_components.launch_at_startup_item.set_checked(!is_checked);
                 }
             } else if menu_event.id == tray_components.quit_item.id() {
-                log::info!("Quit が選択されました。フックを停止して終了します...");
+                log::info!("「capsnav を終了」が選択されました。フックを停止して終了します...");
                 platform::stop_hook();
                 *control_flow = ControlFlow::Exit;
             }

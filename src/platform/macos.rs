@@ -31,6 +31,9 @@ pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 pub const K_CG_EVENT_SOURCE_USER_DATA: u32 = 42;
 
 pub const K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 0x00010000;
+/// macOS IOKit / CoreGraphics における CapsLock の物理押下判定フラグ (stateless modifier)
+pub const NX_ALPHASHIFT_STATELESS_MASK: u64 = 0x01000000;
+pub const NX_DEVICE_ALPHASHIFT_STATELESS_MASK: u64 = 0x00000080;
 
 pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 pub const K_CG_SESSION_EVENT_TAP: u32 = 1;
@@ -42,7 +45,6 @@ static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
-    fn CGEventSourceKeyState(state: i32, keycode: u16) -> bool;
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -93,6 +95,15 @@ pub fn open_accessibility_settings() {
         .spawn();
 }
 
+/// アクセシビリティ権限未付与時のGUIアラートダイアログ表示
+pub fn show_accessibility_dialog() {
+    let msg = "capsnav の実行にはアクセシビリティ権限が必要です。『システム設定 > プライバシーとセキュリティ > アクセシビリティ』で capsnav を許可してください。";
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!("display alert \"capsnav\" message \"{}\" as critical", msg))
+        .spawn();
+}
+
 unsafe extern "C" fn event_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: u32,
@@ -114,13 +125,15 @@ unsafe extern "C" fn event_tap_callback(
         return event;
     }
 
-    // 3. CapsLock 状態変化の捕捉
+    // 3. CapsLock 状態変化の捕捉（物理的なキー押下・離脱フラグを追跡）
     if event_type == K_CG_EVENT_FLAGS_CHANGED {
         let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
         if keycode == KEY_CAPSLOCK {
-            let is_down = CGEventSourceKeyState(1, KEY_CAPSLOCK as u16);
+            let flags = CGEventGetFlags(event);
+            let is_down = (flags & (NX_ALPHASHIFT_STATELESS_MASK | NX_DEVICE_ALPHASHIFT_STATELESS_MASK)) != 0;
             CAPS_PRESSED.store(is_down, Ordering::SeqCst);
-            return ptr::null_mut(); // Suppress event!
+            // CapsLock 自体の本来の大文字固定トグル動作は完全に無効化（イベント破棄）
+            return ptr::null_mut();
         }
     }
 
@@ -133,7 +146,10 @@ unsafe extern "C" fn event_tap_callback(
             let is_down = event_type == K_CG_EVENT_KEY_DOWN;
             let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
             if !new_event.is_null() {
-                let flags = CGEventGetFlags(event) & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT;
+                let flags = CGEventGetFlags(event)
+                    & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT
+                    & !NX_ALPHASHIFT_STATELESS_MASK
+                    & !NX_DEVICE_ALPHASHIFT_STATELESS_MASK;
                 CGEventSetFlags(new_event, flags);
                 CGEventSetIntegerValueField(
                     new_event,
@@ -152,14 +168,12 @@ unsafe extern "C" fn event_tap_callback(
 
 pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
     if !check_accessibility() {
-        // 設定画面を自動で開いてユーザーを誘導
+        // 設定画面を自動で開いてユーザーを誘導し、ダイアログおよびメッセージを表示
         open_accessibility_settings();
+        show_accessibility_dialog();
 
         eprintln!("\n=======================================================");
-        eprintln!("[capsnav] エラー: macOSのアクセシビリティ権限が必要です。");
-        eprintln!("「システム設定 > プライバシーとセキュリティ > アクセシビリティ」を自動で開きました。");
-        eprintln!("リスト内の capsnav（またはターミナル）をオンにしてください。");
-        eprintln!("許可後、再度 capsnav を実行してください。");
+        eprintln!("[capsnav] capsnav の実行にはアクセシビリティ権限が必要です。『システム設定 > プライバシーとセキュリティ > アクセシビリティ』で capsnav を許可してください。");
         eprintln!("=======================================================\n");
         std::process::exit(1);
     }
@@ -248,5 +262,13 @@ mod tests {
 
         assert_eq!(map_char_to_direction('L'), Some(Direction::Right));
         assert_eq!(macos_keycode_to_arrow(KEY_L), Some(KEY_ARROW_RIGHT));
+    }
+
+    #[test]
+    fn test_stateless_masks() {
+        assert_eq!(NX_ALPHASHIFT_STATELESS_MASK, 0x01000000);
+        assert_eq!(NX_DEVICE_ALPHASHIFT_STATELESS_MASK, 0x00000080);
+        assert_eq!(NX_ALPHASHIFT_STATELESS_MASK & NX_DEVICE_ALPHASHIFT_STATELESS_MASK, 0);
+        assert_eq!(NX_ALPHASHIFT_STATELESS_MASK & K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT, 0);
     }
 }

@@ -32,19 +32,19 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
 
     let menu = Menu::new();
 
-    // 1. capsnav (Running) 表示項目（クリック不可）
-    let status_item = MenuItem::new("capsnav (Running)", false, None);
+    // 1. capsnav (稼働中) 表示項目（クリック不可）
+    let status_item = MenuItem::new("capsnav (稼働中)", false, None);
 
     // 2. セパレータ
     let sep1 = PredefinedMenuItem::separator();
 
-    // 3. Enabled トグル項目（チェックマーク付き）
-    let enabled_item = CheckMenuItem::new("Enabled", true, true, None);
+    // 3. 有効 / 一時停止 トグル項目（初期状態: 有効・チェック付き）
+    let enabled_item = CheckMenuItem::new("有効", true, true, None);
 
-    // 4. Launch at Startup トグル項目（現在のOS登録状態を初期値として反映）
+    // 4. ログイン時に起動 トグル項目（現在のOS登録状態を初期値として反映）
     let initial_startup = crate::autolaunch::is_launch_at_startup_enabled();
     let launch_at_startup_item = CheckMenuItem::new(
-        "Launch at Startup",
+        "ログイン時に起動",
         true,
         initial_startup,
         None,
@@ -53,8 +53,8 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
     // 5. セパレータ
     let sep2 = PredefinedMenuItem::separator();
 
-    // 6. Quit capsnav 項目
-    let quit_item = MenuItem::new("Quit capsnav", true, None);
+    // 6. capsnav を終了 項目
+    let quit_item = MenuItem::new("capsnav を終了", true, None);
 
     menu.append_items(&[
         &status_item,
@@ -65,11 +65,18 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
         &quit_item,
     ])?;
 
-    let tray_icon = TrayIconBuilder::new()
+    #[allow(unused_mut)]
+    let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("capsnav - CapsLock -> IJKL Navigation")
-        .with_icon(icon)
-        .build()?;
+        .with_tooltip("capsnav - CapsLock + IJKL 矢印ナビゲーション")
+        .with_icon(icon);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.with_icon_as_template(true);
+    }
+
+    let tray_icon = builder.build()?;
 
     Ok(TrayComponents {
         _tray_icon: tray_icon,

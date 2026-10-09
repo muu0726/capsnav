@@ -1,6 +1,6 @@
 [package]
 name = "capsnav"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["muu0726"]
 description = "A resident cross-platform system tray utility converting CapsLock + IJKL into arrow keys with CapsLock fully suppressed."

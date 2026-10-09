@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CAPITAL, VK_DOWN, VK_LEFT,
     VK_RIGHT, VK_UP, VIRTUAL_KEY,
 };
@@ -125,13 +125,6 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let thread_id = GetCurrentThreadId();
         MAIN_THREAD_ID.store(thread_id, Ordering::SeqCst);
-
-        // 起動時に既にCapsLockがON（LED点灯状態）になっている場合はOFFに補正
-        if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
-            log::info!("起動時にCapsLockがONになっていたため、初期状態(OFF)にリセットします。");
-            send_simulated_key(VK_CAPITAL, false);
-            send_simulated_key(VK_CAPITAL, true);
-        }
 
         let hook = SetWindowsHookExW(
             WH_KEYBOARD_LL,
