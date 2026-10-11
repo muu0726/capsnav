@@ -17,7 +17,7 @@ impl DashboardWindow {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut builder = WindowBuilder::new()
             .with_title("capsnav")
-            .with_inner_size(tao::dpi::LogicalSize::new(490.0, 660.0))
+            .with_inner_size(tao::dpi::LogicalSize::new(510.0, 750.0))
             .with_resizable(false);
 
         if let Ok(img) = image::load_from_memory(crate::tray::ICON_BYTES) {
@@ -47,10 +47,10 @@ impl DashboardWindow {
         }
     }
 
-    pub fn sync_state(&self, enabled: bool, startup: bool) {
+    pub fn sync_state(&self, enabled: bool, startup: bool, extended: bool) {
         let script = format!(
-            "if (window.syncState) {{ window.syncState({}, {}); }}",
-            enabled, startup
+            "if (window.syncState) {{ window.syncState({}, {}, {}); }}",
+            enabled, startup, extended
         );
         let _ = self.webview.evaluate_script(&script);
     }
@@ -78,7 +78,8 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       --accent-green-glow: rgba(16, 185, 129, 0.25);
       --accent-indigo: #6366f1;
       --accent-indigo-glow: rgba(99, 102, 241, 0.25);
-      --danger: #ef4444;
+      --accent-cyan: #06b6d4;
+      --accent-purple: #a855f7;
       --kbd-bg: #1e293b;
       --kbd-border: #334155;
     }
@@ -95,12 +96,13 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
       background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg) 70%);
       color: var(--text-main);
-      padding: 22px 20px 18px;
+      padding: 20px 20px 16px;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 12px;
       overflow-x: hidden;
+      overflow-y: auto;
     }
 
     /* ヘッダー */
@@ -157,8 +159,8 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     .card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 14px;
-      padding: 16px;
+      border-radius: 13px;
+      padding: 14px 16px;
       backdrop-filter: blur(12px);
       transition: all 0.25s ease;
     }
@@ -167,7 +169,7 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     .switch-card {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 10px;
       position: relative;
       overflow: hidden;
     }
@@ -190,11 +192,11 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     .switch-title-wrap {
       display: flex;
       flex-direction: column;
-      gap: 3px;
+      gap: 2px;
     }
 
     .switch-title {
-      font-size: 15px;
+      font-size: 14.5px;
       font-weight: 700;
       display: flex;
       align-items: center;
@@ -218,7 +220,7 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     }
 
     .switch-subtitle {
-      font-size: 12px;
+      font-size: 11.5px;
       color: var(--text-muted);
       line-height: 1.4;
     }
@@ -226,9 +228,10 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     /* トグルスイッチデザイン */
     .toggle {
       position: relative;
-      width: 52px;
-      height: 28px;
+      width: 50px;
+      height: 27px;
       cursor: pointer;
+      flex-shrink: 0;
     }
 
     .toggle input {
@@ -241,7 +244,7 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       position: absolute;
       top: 0; left: 0; right: 0; bottom: 0;
       background: #334155;
-      border-radius: 28px;
+      border-radius: 27px;
       transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
       border: 1px solid rgba(255, 255, 255, 0.1);
     }
@@ -249,8 +252,8 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     .toggle-slider:before {
       position: absolute;
       content: "";
-      height: 20px;
-      width: 20px;
+      height: 19px;
+      width: 19px;
       left: 3px;
       bottom: 3px;
       background: white;
@@ -266,15 +269,15 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     }
 
     .toggle input:checked + .toggle-slider:before {
-      transform: translateX(24px);
+      transform: translateX(23px);
     }
 
     .switch-desc {
-      font-size: 11.5px;
+      font-size: 11px;
       color: #cbd5e1;
       background: rgba(15, 23, 42, 0.6);
-      padding: 8px 10px;
-      border-radius: 8px;
+      padding: 7px 10px;
+      border-radius: 7px;
       border-left: 3px solid var(--accent-green);
       line-height: 1.45;
       transition: all 0.25s ease;
@@ -293,32 +296,60 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     }
 
     .section-title {
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 700;
       color: var(--text-muted);
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
 
-    .keymap-grid {
+    .keymap-container {
       display: flex;
-      align-items: center;
-      justify-content: space-around;
+      flex-direction: column;
+      gap: 10px;
       background: rgba(15, 23, 42, 0.5);
       padding: 12px 14px;
       border-radius: 10px;
     }
 
-    .key-combo {
+    .key-combo-header {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
     }
 
-    .plus-sign {
-      color: var(--text-muted);
-      font-size: 13px;
-      font-weight: 700;
+    .keys-showcase {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .key-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .key-row.sub-row {
+      margin-left: -130px;
+    }
+
+    .key-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      transition: all 0.25s ease;
+    }
+
+    .k-sub {
+      font-size: 10px;
+      font-weight: 600;
+      color: #94a3b8;
     }
 
     kbd {
@@ -329,65 +360,73 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       font-family: inherit;
       font-size: 12px;
       font-weight: 700;
-      padding: 5px 9px;
+      width: 32px;
+      height: 30px;
       border-radius: 6px;
       box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.15);
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      transition: all 0.25s ease;
     }
 
     kbd.caps {
+      width: auto;
+      height: auto;
+      padding: 4px 10px;
       background: linear-gradient(180deg, #4338ca 0%, #312e81 100%);
       border-color: #6366f1;
       border-bottom-color: #3730a3;
       color: #e0e7ff;
     }
 
-    .arrow-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 26px);
-      grid-template-rows: repeat(2, 26px);
-      gap: 3px;
-      justify-items: center;
-      align-items: center;
+    .arrow-key kbd {
+      background: linear-gradient(180deg, #1e3a5f 0%, #0f2744 100%);
+      border-color: #0284c7;
+      color: #38bdf8;
     }
 
-    .arrow-grid .k-up    { grid-column: 2; grid-row: 1; }
-    .arrow-grid .k-left  { grid-column: 1; grid-row: 2; }
-    .arrow-grid .k-down  { grid-column: 2; grid-row: 2; }
-    .arrow-grid .k-right { grid-column: 3; grid-row: 2; }
+    .ext-key kbd {
+      background: linear-gradient(180deg, #3b1d60 0%, #241240 100%);
+      border-color: #9333ea;
+      color: #c084fc;
+    }
 
-    .arrow-grid kbd {
-      width: 25px;
-      height: 25px;
-      padding: 0;
-      font-size: 11px;
+    .del-key kbd {
+      background: linear-gradient(180deg, #581c1c 0%, #3b1010 100%);
+      border-color: #dc2626;
+      color: #f87171;
+    }
+
+    /* 拡張機能無効時の減光 */
+    .ext-disabled .ext-key {
+      opacity: 0.3;
+      filter: grayscale(0.8);
     }
 
     /* お試しテスト入力エリア */
     .test-section {
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 7px;
     }
 
     .test-box {
       width: 100%;
-      height: 64px;
+      height: 76px;
       background: rgba(15, 23, 42, 0.7);
       border: 1px solid var(--card-border);
       border-radius: 9px;
       color: #f1f5f9;
       font-family: inherit;
-      font-size: 12px;
+      font-size: 11.5px;
       padding: 8px 10px;
       resize: none;
       outline: none;
       transition: all 0.2s ease;
       user-select: text;
       -webkit-user-select: text;
-      line-height: 1.4;
+      line-height: 1.45;
     }
 
     .test-box:focus {
@@ -395,28 +434,30 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       box-shadow: 0 0 12px var(--accent-indigo-glow);
     }
 
-    /* 自動起動設定行 */
+    /* 設定行 */
     .setting-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 4px 0;
+      padding: 3px 0;
     }
 
     .setting-info {
       display: flex;
       flex-direction: column;
       gap: 2px;
+      padding-right: 12px;
     }
 
     .setting-title {
-      font-size: 13px;
+      font-size: 12.5px;
       font-weight: 600;
     }
 
     .setting-desc {
-      font-size: 11px;
+      font-size: 10.5px;
       color: var(--text-muted);
+      line-height: 1.35;
     }
 
     /* フッター常駐案内 */
@@ -426,9 +467,9 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       gap: 8px;
       background: rgba(99, 102, 241, 0.08);
       border: 1px dashed rgba(99, 102, 241, 0.25);
-      padding: 9px 12px;
-      border-radius: 9px;
-      font-size: 11px;
+      padding: 8px 11px;
+      border-radius: 8px;
+      font-size: 10.5px;
       color: #c7d2fe;
       line-height: 1.4;
     }
@@ -437,7 +478,6 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       display: flex;
       justify-content: flex-end;
       gap: 8px;
-      margin-top: 2px;
     }
 
     .btn-minimize {
@@ -446,7 +486,7 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       color: #cbd5e1;
       padding: 6px 14px;
       border-radius: 7px;
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 600;
       cursor: pointer;
       transition: all 0.2s ease;
@@ -482,7 +522,7 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
           <span id="statusTitle">CapsLock 無効化 & ナビゲーション 有効</span>
         </div>
         <div class="switch-subtitle" id="statusSubtitle">
-          CapsLock キーは IJKL との組み合わせ時のみ動作します
+          CapsLock キーはナビゲーション時のみ動作します
         </div>
       </div>
       <label class="toggle">
@@ -491,27 +531,34 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       </label>
     </div>
     <div class="switch-desc" id="statusDesc">
-      🟢 CapsLock 本来の大文字トグル機能・LED点灯は完全遮断されています。「CapsLock + I / J / K / L」で矢印キーとして高速移動が可能です。
+      🟢 CapsLock 本来の大文字トグル機能・LED点灯は完全遮断されています。「CapsLock + IJKL / U / O / H / N / Backspace」で高速操作が可能です。
     </div>
   </div>
 
   <!-- キーマップ図解 -->
   <div class="card keymap-section">
     <div class="section-title">Key Mapping Guide</div>
-    <div class="keymap-grid">
-      <div class="key-combo">
+    <div class="keymap-container" id="keymapContainer">
+      <div class="key-combo-header">
         <kbd class="caps">CapsLock</kbd>
-        <span class="plus-sign">+</span>
+        <span>+ キー入力で以下のナビゲーションが発動します:</span>
       </div>
-      <div class="arrow-grid">
-        <kbd class="k-up" title="Up Arrow (↑)">I</kbd>
-        <kbd class="k-left" title="Left Arrow (←)">J</kbd>
-        <kbd class="k-down" title="Down Arrow (↓)">K</kbd>
-        <kbd class="k-right" title="Right Arrow (→)">L</kbd>
-      </div>
-      <div class="key-combo">
-        <span class="plus-sign">=</span>
-        <kbd>↑</kbd> <kbd>←</kbd> <kbd>↓</kbd> <kbd>→</kbd>
+      <div class="keys-showcase">
+        <div class="key-row">
+          <div class="key-item ext-key" title="Home (行頭ジャンプ)"><kbd>U</kbd><span class="k-sub">Home</span></div>
+          <div class="key-item arrow-key" title="Up Arrow (↑)"><kbd>I</kbd><span class="k-sub">↑</span></div>
+          <div class="key-item ext-key" title="End (行末ジャンプ)"><kbd>O</kbd><span class="k-sub">End</span></div>
+          <div class="key-item ext-key del-key" title="Delete (前方削除)"><kbd>⌫</kbd><span class="k-sub">Del</span></div>
+        </div>
+        <div class="key-row">
+          <div class="key-item ext-key" title="PageUp (上スクロール)"><kbd>H</kbd><span class="k-sub">PgUp</span></div>
+          <div class="key-item arrow-key" title="Left Arrow (←)"><kbd>J</kbd><span class="k-sub">←</span></div>
+          <div class="key-item arrow-key" title="Down Arrow (↓)"><kbd>K</kbd><span class="k-sub">↓</span></div>
+          <div class="key-item arrow-key" title="Right Arrow (→)"><kbd>L</kbd><span class="k-sub">→</span></div>
+        </div>
+        <div class="key-row sub-row">
+          <div class="key-item ext-key" title="PageDown (下スクロール)"><kbd>N</kbd><span class="k-sub">PgDn</span></div>
+        </div>
       </div>
     </div>
   </div>
@@ -519,7 +566,25 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   <!-- お試し入力テストエリア -->
   <div class="card test-section">
     <div class="section-title">⚡ お試しテスト入力（ここをクリックして試せます）</div>
-    <textarea class="test-box" id="testBox" spellcheck="false">capsnav が動作中！この枠をクリックして、CapsLock を押しながら I J K L を押すとカーソルがスムーズに移動します。</textarea>
+    <textarea class="test-box" id="testBox" spellcheck="false">capsnav が動作中！この枠内をクリックしてテストしてください:
+・I J K L: 矢印キー移動 (↑ ← ↓ →)
+・U / O: 行頭 (Home) / 行末 (End) へジャンプ
+・H / N: ページ上 (PgUp) / ページ下 (PgDn)
+・Backspace: 前方1文字削除 (Delete)</textarea>
+  </div>
+
+  <!-- 拡張ナビゲーション設定 -->
+  <div class="card">
+    <div class="setting-row">
+      <div class="setting-info">
+        <div class="setting-title">拡張ナビゲーション (Home / End / PgUp / PgDn / Delete)</div>
+        <div class="setting-desc">U (Home), O (End), H (PgUp), N (PgDn), Backspace (Delete) を有効化</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="extendedToggle" checked>
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
   </div>
 
   <!-- 基本設定: 自動起動 -->
@@ -539,7 +604,7 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   <!-- フッター常駐案内 -->
   <div class="footer-notice">
     <span>💡</span>
-    <span>右上の [×] を閉じてもアプリは終了せず、タスクバー右下の通知領域（タスクトレイ）に常駐します。終了はトレイアイコン右クリックの [Quit] から行えます。</span>
+    <span>右上の [×] を閉じてもアプリは終了せず、タスクバー右下の通知領域（タスクトレイ）に常駐します。終了はトレイアイコン右クリックの「capsnav を終了」から行えます。</span>
   </div>
 
   <div class="footer-actions">
@@ -549,38 +614,57 @@ const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   <script>
     const enabledToggle = document.getElementById('enabledToggle');
     const startupToggle = document.getElementById('startupToggle');
+    const extendedToggle = document.getElementById('extendedToggle');
     const mainCard = document.getElementById('mainCard');
     const statusTitle = document.getElementById('statusTitle');
     const statusSubtitle = document.getElementById('statusSubtitle');
     const statusDesc = document.getElementById('statusDesc');
     const btnMinimize = document.getElementById('btnMinimize');
+    const keymapContainer = document.getElementById('keymapContainer');
 
     // UI状態の更新関数 (Rust側から evaluate_script 経由で呼び出し可能)
-    window.syncState = function(enabled, startup) {
+    window.syncState = function(enabled, startup, extended) {
       enabledToggle.checked = enabled;
       startupToggle.checked = startup;
+      if (extended !== undefined) {
+        extendedToggle.checked = extended;
+      }
+
+      if (extendedToggle.checked) {
+        keymapContainer.classList.remove('ext-disabled');
+      } else {
+        keymapContainer.classList.add('ext-disabled');
+      }
 
       if (enabled) {
         mainCard.classList.remove('inactive');
         mainCard.classList.add('active');
         statusTitle.textContent = 'CapsLock 無効化 & ナビゲーション [有効]';
-        statusSubtitle.textContent = 'CapsLock キーは IJKL との組み合わせ時のみ動作します';
-        statusDesc.textContent = '🟢 CapsLock 本来の大文字トグル機能・LED点灯は遮断されています。「CapsLock + I/J/K/L」で矢印キーとして操作できます。';
+        statusSubtitle.textContent = 'CapsLock キーはナビゲーション時のみ動作します';
+        statusDesc.textContent = '🟢 CapsLock 本来の大文字トグル機能・LED点灯は遮断されています。「CapsLock + IJKL / U / O / H / N / Backspace」で高速操作が可能です。';
       } else {
         mainCard.classList.remove('active');
         mainCard.classList.add('inactive');
         statusTitle.textContent = '通常キーモード [一時停止中]';
         statusSubtitle.textContent = 'CapsLock キーは通常の機能に戻っています';
-        statusDesc.textContent = '⚪ CapsLock 本来の大文字切り替え機能が有効です。IJKL ナビゲーションは一時停止しています。';
+        statusDesc.textContent = '⚪ CapsLock 本来の大文字切り替え機能が有効です。ナビゲーションは一時停止しています。';
       }
     };
 
     // スイッチ操作イベント
     enabledToggle.addEventListener('change', () => {
       const val = enabledToggle.checked;
-      window.syncState(val, startupToggle.checked);
+      window.syncState(val, startupToggle.checked, extendedToggle.checked);
       if (window.ipc) {
         window.ipc.postMessage(JSON.stringify({ action: 'toggle_enabled', value: val }));
+      }
+    });
+
+    extendedToggle.addEventListener('change', () => {
+      const val = extendedToggle.checked;
+      window.syncState(enabledToggle.checked, startupToggle.checked, val);
+      if (window.ipc) {
+        window.ipc.postMessage(JSON.stringify({ action: 'toggle_extended', value: val }));
       }
     });
 

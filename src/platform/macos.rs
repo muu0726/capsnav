@@ -17,11 +17,21 @@ pub const KEY_I: i64 = 34;
 pub const KEY_J: i64 = 38;
 pub const KEY_K: i64 = 40;
 pub const KEY_L: i64 = 37;
+pub const KEY_U: i64 = 32;
+pub const KEY_O: i64 = 31;
+pub const KEY_H: i64 = 4;
+pub const KEY_N: i64 = 45;
+pub const KEY_BACKSPACE: i64 = 51;
 
 pub const KEY_ARROW_UP: u16 = 126;
 pub const KEY_ARROW_LEFT: u16 = 123;
 pub const KEY_ARROW_DOWN: u16 = 125;
 pub const KEY_ARROW_RIGHT: u16 = 124;
+pub const KEY_HOME: u16 = 115;
+pub const KEY_END: u16 = 119;
+pub const KEY_PAGE_UP: u16 = 116;
+pub const KEY_PAGE_DOWN: u16 = 121;
+pub const KEY_FORWARD_DELETE: u16 = 117;
 
 pub const K_CG_EVENT_KEY_DOWN: u32 = 10;
 pub const K_CG_EVENT_KEY_UP: u32 = 11;
@@ -74,14 +84,24 @@ extern "C" {
     static kCFRunLoopCommonModes: CFStringRef;
 }
 
-pub fn macos_keycode_to_arrow(keycode: i64) -> Option<u16> {
+pub fn macos_keycode_to_navigation(keycode: i64, allow_extended: bool) -> Option<u16> {
     match keycode {
         KEY_I => Some(KEY_ARROW_UP),
         KEY_J => Some(KEY_ARROW_LEFT),
         KEY_K => Some(KEY_ARROW_DOWN),
         KEY_L => Some(KEY_ARROW_RIGHT),
+        KEY_U if allow_extended => Some(KEY_HOME),
+        KEY_O if allow_extended => Some(KEY_END),
+        KEY_H if allow_extended => Some(KEY_PAGE_UP),
+        KEY_N if allow_extended => Some(KEY_PAGE_DOWN),
+        KEY_BACKSPACE if allow_extended => Some(KEY_FORWARD_DELETE),
         _ => None,
     }
+}
+
+#[allow(dead_code)]
+pub fn macos_keycode_to_arrow(keycode: i64) -> Option<u16> {
+    macos_keycode_to_navigation(keycode, false)
 }
 
 pub fn check_accessibility() -> bool {
@@ -108,6 +128,11 @@ static ACTIVE_I: AtomicBool = AtomicBool::new(false);
 static ACTIVE_J: AtomicBool = AtomicBool::new(false);
 static ACTIVE_K: AtomicBool = AtomicBool::new(false);
 static ACTIVE_L: AtomicBool = AtomicBool::new(false);
+static ACTIVE_U: AtomicBool = AtomicBool::new(false);
+static ACTIVE_O: AtomicBool = AtomicBool::new(false);
+static ACTIVE_H: AtomicBool = AtomicBool::new(false);
+static ACTIVE_N: AtomicBool = AtomicBool::new(false);
+static ACTIVE_BACK: AtomicBool = AtomicBool::new(false);
 
 fn get_active_flag(keycode: i64) -> Option<&'static AtomicBool> {
     match keycode {
@@ -115,6 +140,11 @@ fn get_active_flag(keycode: i64) -> Option<&'static AtomicBool> {
         KEY_J => Some(&ACTIVE_J),
         KEY_K => Some(&ACTIVE_K),
         KEY_L => Some(&ACTIVE_L),
+        KEY_U => Some(&ACTIVE_U),
+        KEY_O => Some(&ACTIVE_O),
+        KEY_H => Some(&ACTIVE_H),
+        KEY_N => Some(&ACTIVE_N),
+        KEY_BACKSPACE => Some(&ACTIVE_BACK),
         _ => None,
     }
 }
@@ -166,40 +196,38 @@ unsafe extern "C" fn event_tap_callback(
             let is_down = (flags & (NX_ALPHASHIFT_STATELESS_MASK | NX_DEVICE_ALPHASHIFT_STATELESS_MASK)) != 0;
             CAPS_PRESSED.store(is_down, Ordering::SeqCst);
             if !is_down {
-                // CapsLock 離脱時に残存している矢印キーがあれば安全に離脱(KEYUP)イベントを送信
-                if ACTIVE_I.swap(false, Ordering::SeqCst) {
-                    post_simulated_arrow(KEY_ARROW_UP, false, flags);
-                }
-                if ACTIVE_J.swap(false, Ordering::SeqCst) {
-                    post_simulated_arrow(KEY_ARROW_LEFT, false, flags);
-                }
-                if ACTIVE_K.swap(false, Ordering::SeqCst) {
-                    post_simulated_arrow(KEY_ARROW_DOWN, false, flags);
-                }
-                if ACTIVE_L.swap(false, Ordering::SeqCst) {
-                    post_simulated_arrow(KEY_ARROW_RIGHT, false, flags);
-                }
+                // CapsLock 離脱時、残存しているナビゲーションキーがあれば安全に離脱(KEYUP)イベントを送信
+                if ACTIVE_I.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_UP, false, flags); }
+                if ACTIVE_J.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_LEFT, false, flags); }
+                if ACTIVE_K.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_DOWN, false, flags); }
+                if ACTIVE_L.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_RIGHT, false, flags); }
+                if ACTIVE_U.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_HOME, false, flags); }
+                if ACTIVE_O.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_END, false, flags); }
+                if ACTIVE_H.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_UP, false, flags); }
+                if ACTIVE_N.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_DOWN, false, flags); }
+                if ACTIVE_BACK.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_FORWARD_DELETE, false, flags); }
             }
             // CapsLock 自体の本来の大文字固定トグル動作は完全に無効化（イベント破棄）
             return ptr::null_mut();
         }
     }
 
-    // 4. I/J/K/L 矢印キー変換 (CapsLock押下中および押下中キーの安全解放)
+    // 4. ナビゲーションキー変換 (CapsLock押下中および押下中キーの安全解放)
     if event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP {
         let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
-        if let Some(target_arrow) = macos_keycode_to_arrow(keycode) {
+        let allow_extended = crate::common::is_extended_enabled();
+        if let Some(target_action) = macos_keycode_to_navigation(keycode, allow_extended) {
             if let Some(active_flag) = get_active_flag(keycode) {
                 if event_type == K_CG_EVENT_KEY_DOWN {
                     if CAPS_PRESSED.load(Ordering::SeqCst) {
                         active_flag.store(true, Ordering::SeqCst);
-                        post_simulated_arrow(target_arrow, true, CGEventGetFlags(event));
+                        post_simulated_arrow(target_action, true, CGEventGetFlags(event));
                         return ptr::null_mut();
                     }
                 } else if event_type == K_CG_EVENT_KEY_UP {
-                    // 既に矢印として押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
+                    // 既に変換キーとして押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
                     if active_flag.swap(false, Ordering::SeqCst) {
-                        post_simulated_arrow(target_arrow, false, CGEventGetFlags(event));
+                        post_simulated_arrow(target_action, false, CGEventGetFlags(event));
                         return ptr::null_mut();
                     }
                 }
@@ -322,7 +350,32 @@ mod tests {
         assert!(get_active_flag(KEY_J).is_some());
         assert!(get_active_flag(KEY_K).is_some());
         assert!(get_active_flag(KEY_L).is_some());
+        assert!(get_active_flag(KEY_U).is_some());
+        assert!(get_active_flag(KEY_O).is_some());
+        assert!(get_active_flag(KEY_H).is_some());
+        assert!(get_active_flag(KEY_N).is_some());
+        assert!(get_active_flag(KEY_BACKSPACE).is_some());
         assert!(get_active_flag(KEY_CAPSLOCK).is_none());
         assert!(get_active_flag(0).is_none());
+    }
+
+    #[test]
+    fn test_macos_keycode_to_navigation() {
+        assert_eq!(macos_keycode_to_navigation(KEY_U, true), Some(KEY_HOME));
+        assert_eq!(macos_keycode_to_navigation(KEY_O, true), Some(KEY_END));
+        assert_eq!(macos_keycode_to_navigation(KEY_H, true), Some(KEY_PAGE_UP));
+        assert_eq!(macos_keycode_to_navigation(KEY_N, true), Some(KEY_PAGE_DOWN));
+        assert_eq!(macos_keycode_to_navigation(KEY_BACKSPACE, true), Some(KEY_FORWARD_DELETE));
+
+        // 拡張無効時
+        assert_eq!(macos_keycode_to_navigation(KEY_U, false), None);
+        assert_eq!(macos_keycode_to_navigation(KEY_O, false), None);
+        assert_eq!(macos_keycode_to_navigation(KEY_H, false), None);
+        assert_eq!(macos_keycode_to_navigation(KEY_N, false), None);
+        assert_eq!(macos_keycode_to_navigation(KEY_BACKSPACE, false), None);
+
+        // 矢印キーは常に有効
+        assert_eq!(macos_keycode_to_navigation(KEY_I, false), Some(KEY_ARROW_UP));
+        assert_eq!(macos_keycode_to_navigation(KEY_I, true), Some(KEY_ARROW_UP));
     }
 }

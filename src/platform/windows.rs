@@ -5,8 +5,9 @@ use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CAPITAL, VK_DOWN, VK_LEFT,
-    VK_RIGHT, VK_UP, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CAPITAL, VK_DELETE,
+    VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
+    VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW,
@@ -25,28 +26,48 @@ static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 /// フックハンドル（プロセス終了時の安全なクリーンアップ用）
 static HOOK_HANDLE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-// I/J/K/L の Virtual Key Code (ASCII値と一致)
+// ナビゲーションキーの Virtual Key Code
 pub const VK_I: u32 = 0x49;
 pub const VK_J: u32 = 0x4A;
 pub const VK_K: u32 = 0x4B;
 pub const VK_L: u32 = 0x4C;
+pub const VK_U: u32 = 0x55;
+pub const VK_O: u32 = 0x4F;
+pub const VK_H: u32 = 0x48;
+pub const VK_N: u32 = 0x4E;
+pub const VK_BACK_CODE: u32 = 0x08;
 
-/// IJKLキーコードを対応する矢印キーのVIRTUAL_KEYに変換する純粋関数
-pub fn vk_to_arrow(vk_code: u32) -> Option<VIRTUAL_KEY> {
+/// 入力キーコードを対応するナビゲーションキーのVIRTUAL_KEYに変換する純粋関数
+pub fn vk_to_navigation(vk_code: u32, allow_extended: bool) -> Option<VIRTUAL_KEY> {
     match vk_code {
         VK_I => Some(VK_UP),
         VK_J => Some(VK_LEFT),
         VK_K => Some(VK_DOWN),
         VK_L => Some(VK_RIGHT),
+        VK_U if allow_extended => Some(VK_HOME),
+        VK_O if allow_extended => Some(VK_END),
+        VK_H if allow_extended => Some(VK_PRIOR),
+        VK_N if allow_extended => Some(VK_NEXT),
+        VK_BACK_CODE if allow_extended => Some(VK_DELETE),
         _ => None,
     }
 }
 
-/// 各IJKLキーが現在シミュレート矢印キーとして押下中かどうかのフラグ
+#[allow(dead_code)]
+pub fn vk_to_arrow(vk_code: u32) -> Option<VIRTUAL_KEY> {
+    vk_to_navigation(vk_code, false)
+}
+
+/// 各ナビゲーションキーが現在シミュレートキーとして押下中かどうかのフラグ
 static ACTIVE_I: AtomicBool = AtomicBool::new(false);
 static ACTIVE_J: AtomicBool = AtomicBool::new(false);
 static ACTIVE_K: AtomicBool = AtomicBool::new(false);
 static ACTIVE_L: AtomicBool = AtomicBool::new(false);
+static ACTIVE_U: AtomicBool = AtomicBool::new(false);
+static ACTIVE_O: AtomicBool = AtomicBool::new(false);
+static ACTIVE_H: AtomicBool = AtomicBool::new(false);
+static ACTIVE_N: AtomicBool = AtomicBool::new(false);
+static ACTIVE_BACK: AtomicBool = AtomicBool::new(false);
 
 fn get_active_flag(vk: u32) -> Option<&'static AtomicBool> {
     match vk {
@@ -54,6 +75,11 @@ fn get_active_flag(vk: u32) -> Option<&'static AtomicBool> {
         VK_J => Some(&ACTIVE_J),
         VK_K => Some(&ACTIVE_K),
         VK_L => Some(&ACTIVE_L),
+        VK_U => Some(&ACTIVE_U),
+        VK_O => Some(&ACTIVE_O),
+        VK_H => Some(&ACTIVE_H),
+        VK_N => Some(&ACTIVE_N),
+        VK_BACK_CODE => Some(&ACTIVE_BACK),
         _ => None,
     }
 }
@@ -87,37 +113,35 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
             } else if is_up {
                 CAPS_PRESSED.store(false, Ordering::SeqCst);
-                // CapsLock離脱時、万一矢印キーが押下されたままになっていた場合は安全に離脱(KEYUP)を送信
-                if ACTIVE_I.swap(false, Ordering::SeqCst) {
-                    send_simulated_key(VK_UP, true);
-                }
-                if ACTIVE_J.swap(false, Ordering::SeqCst) {
-                    send_simulated_key(VK_LEFT, true);
-                }
-                if ACTIVE_K.swap(false, Ordering::SeqCst) {
-                    send_simulated_key(VK_DOWN, true);
-                }
-                if ACTIVE_L.swap(false, Ordering::SeqCst) {
-                    send_simulated_key(VK_RIGHT, true);
-                }
+                // CapsLock離脱時、残存しているナビゲーションキーがあれば安全に離脱(KEYUP)を送信
+                if ACTIVE_I.swap(false, Ordering::SeqCst) { send_simulated_key(VK_UP, true); }
+                if ACTIVE_J.swap(false, Ordering::SeqCst) { send_simulated_key(VK_LEFT, true); }
+                if ACTIVE_K.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DOWN, true); }
+                if ACTIVE_L.swap(false, Ordering::SeqCst) { send_simulated_key(VK_RIGHT, true); }
+                if ACTIVE_U.swap(false, Ordering::SeqCst) { send_simulated_key(VK_HOME, true); }
+                if ACTIVE_O.swap(false, Ordering::SeqCst) { send_simulated_key(VK_END, true); }
+                if ACTIVE_H.swap(false, Ordering::SeqCst) { send_simulated_key(VK_PRIOR, true); }
+                if ACTIVE_N.swap(false, Ordering::SeqCst) { send_simulated_key(VK_NEXT, true); }
+                if ACTIVE_BACK.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DELETE, true); }
             }
             // LRESULT(1) を返すことで、OSおよび他アプリへのキー伝播を完全に遮断
             return LRESULT(1);
         }
 
-        // 4. I/J/K/L 矢印キー変換 (CapsLock押下中および押下中キーの安全解放)
-        if let Some(target_arrow_vk) = vk_to_arrow(kbd.vkCode) {
+        // 4. ナビゲーションキー変換 (CapsLock押下中および押下中キーの安全解放)
+        let allow_extended = crate::common::is_extended_enabled();
+        if let Some(target_vk) = vk_to_navigation(kbd.vkCode, allow_extended) {
             if let Some(active_flag) = get_active_flag(kbd.vkCode) {
                 if is_down {
                     if CAPS_PRESSED.load(Ordering::SeqCst) {
                         active_flag.store(true, Ordering::SeqCst);
-                        send_simulated_key(target_arrow_vk, false);
+                        send_simulated_key(target_vk, false);
                         return LRESULT(1);
                     }
                 } else if is_up {
-                    // 既に矢印として押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
+                    // 既に変換キーとして押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
                     if active_flag.swap(false, Ordering::SeqCst) {
-                        send_simulated_key(target_arrow_vk, true);
+                        send_simulated_key(target_vk, true);
                         return LRESULT(1);
                     }
                 }
@@ -242,7 +266,32 @@ mod tests {
         assert!(get_active_flag(VK_J).is_some());
         assert!(get_active_flag(VK_K).is_some());
         assert!(get_active_flag(VK_L).is_some());
+        assert!(get_active_flag(VK_U).is_some());
+        assert!(get_active_flag(VK_O).is_some());
+        assert!(get_active_flag(VK_H).is_some());
+        assert!(get_active_flag(VK_N).is_some());
+        assert!(get_active_flag(VK_BACK_CODE).is_some());
         assert!(get_active_flag(VK_CAPITAL.0 as u32).is_none());
         assert!(get_active_flag(0x41).is_none()); // 'A'
+    }
+
+    #[test]
+    fn test_vk_to_navigation() {
+        assert_eq!(vk_to_navigation(VK_U, true), Some(VK_HOME));
+        assert_eq!(vk_to_navigation(VK_O, true), Some(VK_END));
+        assert_eq!(vk_to_navigation(VK_H, true), Some(VK_PRIOR));
+        assert_eq!(vk_to_navigation(VK_N, true), Some(VK_NEXT));
+        assert_eq!(vk_to_navigation(VK_BACK_CODE, true), Some(VK_DELETE));
+
+        // 拡張無効時
+        assert_eq!(vk_to_navigation(VK_U, false), None);
+        assert_eq!(vk_to_navigation(VK_O, false), None);
+        assert_eq!(vk_to_navigation(VK_H, false), None);
+        assert_eq!(vk_to_navigation(VK_N, false), None);
+        assert_eq!(vk_to_navigation(VK_BACK_CODE, false), None);
+
+        // 矢印キーは常に有効
+        assert_eq!(vk_to_navigation(VK_I, false), Some(VK_UP));
+        assert_eq!(vk_to_navigation(VK_I, true), Some(VK_UP));
     }
 }

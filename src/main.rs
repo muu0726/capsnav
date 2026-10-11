@@ -161,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tray_components.status_item.set_text(new_status);
 
                     if let Some(ref d) = dashboard {
-                        d.sync_state(is_checked, autolaunch::is_launch_at_startup_enabled());
+                        d.sync_state(is_checked, autolaunch::is_launch_at_startup_enabled(), common::is_extended_enabled());
                     }
                 } else if menu_event.id == tray_components.launch_at_startup_item.id() {
                     let is_checked = tray_components.launch_at_startup_item.is_checked();
@@ -169,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log::error!("自動起動設定の変更に失敗しました: {}", e);
                         tray_components.launch_at_startup_item.set_checked(!is_checked);
                     } else if let Some(ref d) = dashboard {
-                        d.sync_state(common::is_enabled(), is_checked);
+                        d.sync_state(common::is_enabled(), is_checked, common::is_extended_enabled());
                     }
                 } else if menu_event.id == tray_components.quit_item.id() {
                     log::info!("Quit が選択されました。フックを停止して終了します...");
@@ -194,7 +194,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::info!("CapsLock 無効化 & ナビゲーション切り替え (GUIスイッチ): {}", new_val);
 
                     if let Some(ref d) = dashboard {
-                        d.sync_state(new_val, autolaunch::is_launch_at_startup_enabled());
+                        d.sync_state(new_val, autolaunch::is_launch_at_startup_enabled(), common::is_extended_enabled());
+                    }
+                } else if msg.contains(r#""action":"toggle_extended""#) {
+                    let new_val = msg.contains(r#""value":true"#);
+                    common::set_extended_enabled(new_val);
+                    log::info!("拡張ナビゲーション切り替え (GUIスイッチ): {}", new_val);
+
+                    if let Some(ref d) = dashboard {
+                        d.sync_state(common::is_enabled(), autolaunch::is_launch_at_startup_enabled(), new_val);
                     }
                 } else if msg.contains(r#""action":"toggle_startup""#) {
                     let new_val = msg.contains(r#""value":true"#);
@@ -205,7 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log::info!("自動起動設定を変更しました (GUIスイッチ): {}", new_val);
                     }
                     if let Some(ref d) = dashboard {
-                        d.sync_state(common::is_enabled(), autolaunch::is_launch_at_startup_enabled());
+                        d.sync_state(common::is_enabled(), autolaunch::is_launch_at_startup_enabled(), common::is_extended_enabled());
                     }
                 } else if msg.contains(r#""action":"minimize""#) {
                     if let Some(ref d) = dashboard {
@@ -213,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else if msg.contains(r#""action":"get_initial_state""#) {
                     if let Some(ref d) = dashboard {
-                        d.sync_state(common::is_enabled(), autolaunch::is_launch_at_startup_enabled());
+                        d.sync_state(common::is_enabled(), autolaunch::is_launch_at_startup_enabled(), common::is_extended_enabled());
                     }
                 }
             }
