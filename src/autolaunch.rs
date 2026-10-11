@@ -10,6 +10,7 @@ pub fn create_auto_launcher() -> Result<AutoLaunch, Box<dyn std::error::Error>> 
     let auto = AutoLaunchBuilder::new()
         .set_app_name("capsnav")
         .set_app_path(&path_str)
+        .set_args(&["--minimized"])
         .build()?;
 
     Ok(auto)

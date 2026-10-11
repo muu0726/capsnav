@@ -18,6 +18,7 @@ enum UserEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Ipc(String),
+    ShowDashboard,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _instance_guard = match single_instance::acquire_single_instance("capsnav") {
         Some(guard) => guard,
         None => {
-            log::warn!("capsnav は既に起動しています。二重起動を防止して終了します。");
+            log::info!("既存の capsnav インスタンスへ画面表示を通知して終了します。");
+            single_instance::signal_existing_instance("capsnav");
             return Ok(());
         }
     };
@@ -76,7 +78,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // 6. Ctrl+C 終了ハンドラの設定
+    // 6. 既存インスタンスへの画面表示通知リスナーの起動
+    if let Some(listener) = single_instance::create_show_listener("capsnav") {
+        let proxy_show = event_loop.create_proxy();
+        let _ = std::thread::Builder::new()
+            .name("show-listener".to_string())
+            .spawn(move || {
+                while listener.wait_next() {
+                    let _ = proxy_show.send_event(UserEvent::ShowDashboard);
+                }
+            });
+    }
+
+    // 7. スタートアップ等からの起動時 (--minimized / --tray) は初期状態で非表示化
+    let is_minimized_arg = std::env::args().any(|arg| arg == "--minimized" || arg == "--tray");
+    if is_minimized_arg {
+        if let Some(ref d) = dashboard {
+            d.set_visible(false);
+            log::info!("--minimized 指定を検出したため、タスクトレイ常駐状態で起動しました。");
+        }
+    }
+
+    // 8. Ctrl+C 終了ハンドラの設定
     ctrlc::set_handler(move || {
         log::info!("Ctrl+C を受信しました。終了処理を実行します...");
         platform::stop_hook();
@@ -85,11 +108,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("capsnav の常駐を開始しました。");
 
-    // 7. メインスレッドでの GUI イベントループ実行
+    // 9. メインスレッドでの GUI イベントループ実行
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            // 別インスタンスからの画面表示要求
+            Event::UserEvent(UserEvent::ShowDashboard) => {
+                if let Some(ref d) = dashboard {
+                    d.set_visible(true);
+                }
+            }
+
             // ウィンドウの閉じる [X] ボタンが押された場合: 終了させずタスクトレイに最小化
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,

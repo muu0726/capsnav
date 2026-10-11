@@ -42,6 +42,22 @@ pub fn vk_to_arrow(vk_code: u32) -> Option<VIRTUAL_KEY> {
     }
 }
 
+/// 各IJKLキーが現在シミュレート矢印キーとして押下中かどうかのフラグ
+static ACTIVE_I: AtomicBool = AtomicBool::new(false);
+static ACTIVE_J: AtomicBool = AtomicBool::new(false);
+static ACTIVE_K: AtomicBool = AtomicBool::new(false);
+static ACTIVE_L: AtomicBool = AtomicBool::new(false);
+
+fn get_active_flag(vk: u32) -> Option<&'static AtomicBool> {
+    match vk {
+        VK_I => Some(&ACTIVE_I),
+        VK_J => Some(&ACTIVE_J),
+        VK_K => Some(&ACTIVE_K),
+        VK_L => Some(&ACTIVE_L),
+        _ => None,
+    }
+}
+
 /// 低レベルキーボードフックコールバック
 unsafe extern "system" fn low_level_keyboard_proc(
     n_code: i32,
@@ -71,23 +87,41 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
             } else if is_up {
                 CAPS_PRESSED.store(false, Ordering::SeqCst);
+                // CapsLock離脱時、万一矢印キーが押下されたままになっていた場合は安全に離脱(KEYUP)を送信
+                if ACTIVE_I.swap(false, Ordering::SeqCst) {
+                    send_simulated_key(VK_UP, true);
+                }
+                if ACTIVE_J.swap(false, Ordering::SeqCst) {
+                    send_simulated_key(VK_LEFT, true);
+                }
+                if ACTIVE_K.swap(false, Ordering::SeqCst) {
+                    send_simulated_key(VK_DOWN, true);
+                }
+                if ACTIVE_L.swap(false, Ordering::SeqCst) {
+                    send_simulated_key(VK_RIGHT, true);
+                }
             }
             // LRESULT(1) を返すことで、OSおよび他アプリへのキー伝播を完全に遮断
             return LRESULT(1);
         }
 
-        // 3. CapsLock押下中における I/J/K/L 矢印キー変換
-        if CAPS_PRESSED.load(Ordering::SeqCst) {
-            if let Some(target_arrow_vk) = vk_to_arrow(kbd.vkCode) {
+        // 4. I/J/K/L 矢印キー変換 (CapsLock押下中および押下中キーの安全解放)
+        if let Some(target_arrow_vk) = vk_to_arrow(kbd.vkCode) {
+            if let Some(active_flag) = get_active_flag(kbd.vkCode) {
                 if is_down {
-                    send_simulated_key(target_arrow_vk, false);
+                    if CAPS_PRESSED.load(Ordering::SeqCst) {
+                        active_flag.store(true, Ordering::SeqCst);
+                        send_simulated_key(target_arrow_vk, false);
+                        return LRESULT(1);
+                    }
                 } else if is_up {
-                    send_simulated_key(target_arrow_vk, true);
+                    // 既に矢印として押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
+                    if active_flag.swap(false, Ordering::SeqCst) {
+                        send_simulated_key(target_arrow_vk, true);
+                        return LRESULT(1);
+                    }
                 }
-                // 元の I/J/K/L キー入力を破棄
-                return LRESULT(1);
             }
-            // I/J/K/L 以外のキー入力はそのまま通過
         }
     }
 
@@ -200,5 +234,15 @@ mod tests {
 
         assert_eq!(map_char_to_direction('L'), Some(Direction::Right));
         assert_eq!(vk_to_arrow(VK_L), Some(VK_RIGHT));
+    }
+
+    #[test]
+    fn test_active_flags() {
+        assert!(get_active_flag(VK_I).is_some());
+        assert!(get_active_flag(VK_J).is_some());
+        assert!(get_active_flag(VK_K).is_some());
+        assert!(get_active_flag(VK_L).is_some());
+        assert!(get_active_flag(VK_CAPITAL.0 as u32).is_none());
+        assert!(get_active_flag(0x41).is_none()); // 'A'
     }
 }

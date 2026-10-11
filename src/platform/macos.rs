@@ -104,6 +104,39 @@ pub fn show_accessibility_dialog() {
         .spawn();
 }
 
+static ACTIVE_I: AtomicBool = AtomicBool::new(false);
+static ACTIVE_J: AtomicBool = AtomicBool::new(false);
+static ACTIVE_K: AtomicBool = AtomicBool::new(false);
+static ACTIVE_L: AtomicBool = AtomicBool::new(false);
+
+fn get_active_flag(keycode: i64) -> Option<&'static AtomicBool> {
+    match keycode {
+        KEY_I => Some(&ACTIVE_I),
+        KEY_J => Some(&ACTIVE_J),
+        KEY_K => Some(&ACTIVE_K),
+        KEY_L => Some(&ACTIVE_L),
+        _ => None,
+    }
+}
+
+unsafe fn post_simulated_arrow(target_arrow: u16, is_down: bool, base_flags: u64) {
+    let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
+    if !new_event.is_null() {
+        let flags = base_flags
+            & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT
+            & !NX_ALPHASHIFT_STATELESS_MASK
+            & !NX_DEVICE_ALPHASHIFT_STATELESS_MASK;
+        CGEventSetFlags(new_event, flags);
+        CGEventSetIntegerValueField(
+            new_event,
+            K_CG_EVENT_SOURCE_USER_DATA,
+            crate::common::INJECTED_SIGNATURE as i64,
+        );
+        CGEventPost(0, new_event); // kCGHIDEventTap
+        CFRelease(new_event);
+    }
+}
+
 unsafe extern "C" fn event_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: u32,
@@ -132,34 +165,45 @@ unsafe extern "C" fn event_tap_callback(
             let flags = CGEventGetFlags(event);
             let is_down = (flags & (NX_ALPHASHIFT_STATELESS_MASK | NX_DEVICE_ALPHASHIFT_STATELESS_MASK)) != 0;
             CAPS_PRESSED.store(is_down, Ordering::SeqCst);
+            if !is_down {
+                // CapsLock 離脱時に残存している矢印キーがあれば安全に離脱(KEYUP)イベントを送信
+                if ACTIVE_I.swap(false, Ordering::SeqCst) {
+                    post_simulated_arrow(KEY_ARROW_UP, false, flags);
+                }
+                if ACTIVE_J.swap(false, Ordering::SeqCst) {
+                    post_simulated_arrow(KEY_ARROW_LEFT, false, flags);
+                }
+                if ACTIVE_K.swap(false, Ordering::SeqCst) {
+                    post_simulated_arrow(KEY_ARROW_DOWN, false, flags);
+                }
+                if ACTIVE_L.swap(false, Ordering::SeqCst) {
+                    post_simulated_arrow(KEY_ARROW_RIGHT, false, flags);
+                }
+            }
             // CapsLock 自体の本来の大文字固定トグル動作は完全に無効化（イベント破棄）
             return ptr::null_mut();
         }
     }
 
-    // 4. CapsLock押下中における I/J/K/L 矢印キー変換
-    if CAPS_PRESSED.load(Ordering::SeqCst)
-        && (event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP)
-    {
+    // 4. I/J/K/L 矢印キー変換 (CapsLock押下中および押下中キーの安全解放)
+    if event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP {
         let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
         if let Some(target_arrow) = macos_keycode_to_arrow(keycode) {
-            let is_down = event_type == K_CG_EVENT_KEY_DOWN;
-            let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
-            if !new_event.is_null() {
-                let flags = CGEventGetFlags(event)
-                    & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT
-                    & !NX_ALPHASHIFT_STATELESS_MASK
-                    & !NX_DEVICE_ALPHASHIFT_STATELESS_MASK;
-                CGEventSetFlags(new_event, flags);
-                CGEventSetIntegerValueField(
-                    new_event,
-                    K_CG_EVENT_SOURCE_USER_DATA,
-                    crate::common::INJECTED_SIGNATURE as i64,
-                );
-                CGEventPost(0, new_event); // kCGHIDEventTap
-                CFRelease(new_event);
+            if let Some(active_flag) = get_active_flag(keycode) {
+                if event_type == K_CG_EVENT_KEY_DOWN {
+                    if CAPS_PRESSED.load(Ordering::SeqCst) {
+                        active_flag.store(true, Ordering::SeqCst);
+                        post_simulated_arrow(target_arrow, true, CGEventGetFlags(event));
+                        return ptr::null_mut();
+                    }
+                } else if event_type == K_CG_EVENT_KEY_UP {
+                    // 既に矢印として押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
+                    if active_flag.swap(false, Ordering::SeqCst) {
+                        post_simulated_arrow(target_arrow, false, CGEventGetFlags(event));
+                        return ptr::null_mut();
+                    }
+                }
             }
-            return ptr::null_mut(); // Suppress original IJKL key!
         }
     }
 
@@ -270,5 +314,15 @@ mod tests {
         assert_eq!(NX_DEVICE_ALPHASHIFT_STATELESS_MASK, 0x00000080);
         assert_eq!(NX_ALPHASHIFT_STATELESS_MASK & NX_DEVICE_ALPHASHIFT_STATELESS_MASK, 0);
         assert_eq!(NX_ALPHASHIFT_STATELESS_MASK & K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT, 0);
+    }
+
+    #[test]
+    fn test_active_flags_macos() {
+        assert!(get_active_flag(KEY_I).is_some());
+        assert!(get_active_flag(KEY_J).is_some());
+        assert!(get_active_flag(KEY_K).is_some());
+        assert!(get_active_flag(KEY_L).is_some());
+        assert!(get_active_flag(KEY_CAPSLOCK).is_none());
+        assert!(get_active_flag(0).is_none());
     }
 }
