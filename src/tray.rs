@@ -11,6 +11,7 @@ pub const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 pub struct TrayComponents {
     #[allow(dead_code)]
     pub _tray_icon: TrayIcon,
+    pub open_item: MenuItem,
     pub status_item: MenuItem,
     pub enabled_item: CheckMenuItem,
     pub launch_at_startup_item: CheckMenuItem,
@@ -32,16 +33,19 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
 
     let menu = Menu::new();
 
-    // 1. capsnav (稼働中) 表示項目（クリック不可）
+    // 1. ダッシュボードを開く項目
+    let open_item = MenuItem::new("ダッシュボードを開く", true, None);
+
+    // 2. capsnav (稼働中) 表示項目（クリック不可）
     let status_item = MenuItem::new("capsnav (稼働中)", false, None);
 
-    // 2. セパレータ
+    // 3. セパレータ
     let sep1 = PredefinedMenuItem::separator();
 
-    // 3. 有効 / 一時停止 トグル項目（初期状態: 有効・チェック付き）
-    let enabled_item = CheckMenuItem::new("有効", true, true, None);
+    // 4. Enabled トグル項目（チェックマーク付き）
+    let enabled_item = CheckMenuItem::new("有効 (CapsLock無効化 & IJKL)", true, true, None);
 
-    // 4. ログイン時に起動 トグル項目（現在のOS登録状態を初期値として反映）
+    // 5. ログイン時に起動 トグル項目（現在のOS登録状態を初期値として反映）
     let initial_startup = crate::autolaunch::is_launch_at_startup_enabled();
     let launch_at_startup_item = CheckMenuItem::new(
         "ログイン時に起動",
@@ -50,13 +54,14 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
         None,
     );
 
-    // 5. セパレータ
+    // 6. セパレータ
     let sep2 = PredefinedMenuItem::separator();
 
-    // 6. capsnav を終了 項目
+    // 7. capsnav を終了 項目
     let quit_item = MenuItem::new("capsnav を終了", true, None);
 
     menu.append_items(&[
+        &open_item,
         &status_item,
         &sep1,
         &enabled_item,
@@ -83,6 +88,7 @@ pub fn setup_tray() -> Result<TrayComponents, Box<dyn std::error::Error>> {
 
     Ok(TrayComponents {
         _tray_icon: tray_icon,
+        open_item,
         status_item,
         enabled_item,
         launch_at_startup_item,

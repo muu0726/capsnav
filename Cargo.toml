@@ -1,6 +1,6 @@
 [package]
 name = "capsnav"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["muu0726"]
 description = "A resident cross-platform system tray utility converting CapsLock + IJKL into arrow keys with CapsLock fully suppressed."
@@ -16,6 +16,7 @@ tray-icon = "0.26"
 tao = "0.37"
 image = { version = "0.25", default-features = false, features = ["png"] }
 auto-launch = "0.6.0"
+wry = "0.57"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -24,4 +25,5 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_Security",
 ] }
