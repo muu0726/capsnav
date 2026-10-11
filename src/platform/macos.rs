@@ -38,6 +38,7 @@ pub const K_CG_EVENT_KEY_UP: u32 = 11;
 pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
 
 pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+#[allow(dead_code)]
 pub const K_CG_EVENT_SOURCE_USER_DATA: u32 = 42;
 
 pub const K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 0x00010000;
@@ -75,8 +76,10 @@ extern "C" {
     fn CFRelease(cf: *const c_void);
 
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    #[allow(dead_code)]
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventGetFlags(event: CGEventRef) -> u64;
+    #[allow(dead_code)]
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventCreateKeyboardEvent(source: *mut c_void, virtual_key: u16, key_down: bool) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);

@@ -21,6 +21,8 @@ pub fn acquire_single_instance(app_id: &str) -> Option<SingleInstanceGuard> {
     unsafe {
         let handle = CreateMutexW(None, true, windows::core::PCWSTR(hstring.as_ptr())).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            use windows::Win32::Foundation::CloseHandle;
+            let _ = CloseHandle(handle);
             log::warn!("既存のインスタンスが既に実行中です。二重起動を防止して終了します。");
             None
         } else {
@@ -105,6 +107,11 @@ impl Drop for ShowEventListener {
 pub struct SingleInstanceGuard;
 
 #[cfg(not(windows))]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {}
+}
+
+#[cfg(not(windows))]
 pub fn acquire_single_instance(_app_id: &str) -> Option<SingleInstanceGuard> {
     Some(SingleInstanceGuard)
 }
@@ -113,6 +120,7 @@ pub fn acquire_single_instance(_app_id: &str) -> Option<SingleInstanceGuard> {
 pub fn signal_existing_instance(_app_id: &str) {}
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub struct ShowEventListener;
 
 #[cfg(not(windows))]
@@ -121,6 +129,7 @@ pub fn create_show_listener(_app_id: &str) -> Option<ShowEventListener> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 impl ShowEventListener {
     pub fn wait_next(&self) -> bool {
         false
@@ -142,7 +151,10 @@ mod tests {
             assert!(guard2.is_none(), "2つ目のインスタンスはブロックされる必要があります");
         }
 
+        #[cfg(windows)]
         drop(guard1);
+        #[cfg(not(windows))]
+        let _ = guard1;
 
         #[cfg(windows)]
         {
