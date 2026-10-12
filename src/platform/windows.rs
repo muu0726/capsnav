@@ -1,7 +1,9 @@
-//! Windows プラットフォーム向けキーフック実装 (WH_KEYBOARD_LL + GetAsyncKeyState + SendInput)
+//! Windows プラットフォーム向けキーフック実装 (WH_KEYBOARD_LL + Raw Input + GetAsyncKeyState + SendInput)
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -9,16 +11,28 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CAPITAL, VK_DELETE, VK_DOWN, VK_END, VK_HOME,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP, VIRTUAL_KEY,
 };
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
+    RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, PostThreadMessageW, RegisterClassExW, SetWindowsHookExW,
+    UnhookWindowsHookEx, HCURSOR, HHOOK, HICON, HMENU, KBDLLHOOKSTRUCT, MSG,
+    WH_KEYBOARD_LL, WINDOW_EX_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WNDCLASS_STYLES, WS_POPUP,
 };
 
 use crate::common::INJECTED_SIGNATURE;
 
 /// CapsLockが物理的に押下されているかどうかの状態フラグ
 static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Raw Input によるハードウェアスキャンコード0x3Aの物理押下状態フラグ
+static RAW_INPUT_CAPS_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Raw Input によるキーボード監視が正常に有効化されているかどうかのフラグ
+static RAW_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// 解放監視スレッドの実行状態フラグ
 static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -27,13 +41,17 @@ static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
 static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
 /// フックハンドル（プロセス終了時の安全なクリーンアップ用）
-static HOOK_HANDLE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 /// CapsLockの標準ハードウェアスキャンコード (AT / PS/2 / USB HID共通)
 pub const SCANCODE_CAPSLOCK: u32 = 0x3A;
 
 /// 日本語キーボードにおける「英数 (CapsLock)」キー単体押下時の仮想キーコード
 pub const VK_OEM_ATTN_CODE: u32 = 0xF0;
+
+/// Raw Input のキーボードイベントフラグ (RI_KEY_BREAK, RI_KEY_E0)
+pub const RI_KEY_BREAK: u16 = 0x01;
+pub const RI_KEY_E0: u16 = 0x02;
 
 /// CapsLockキー（英語配列・日本語配列の英数キーを含む）であるかを判定する純粋関数
 pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
@@ -49,6 +67,18 @@ pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
 
 /// CapsLock（または日本語キーボードの英数キー）が現在物理的に押下されているかを判定する純粋関数
 pub fn is_capslock_physically_down() -> bool {
+    // 1. Raw Input が稼働している場合、ハードウェアスキャンコード0x3Aの状態を判定
+    if RAW_INPUT_ACTIVE.load(Ordering::SeqCst) {
+        if RAW_INPUT_CAPS_DOWN.load(Ordering::SeqCst) {
+            return true;
+        }
+        // US配列等の VK_CAPITAL 直接判定も補助として併用
+        unsafe {
+            return (GetAsyncKeyState(VK_CAPITAL.0 as i32) as u16 & 0x8000) != 0;
+        }
+    }
+
+    // 2. Raw Input 非稼働環境でのフォールバック (GetAsyncKeyState)
     unsafe {
         let capital_down = (GetAsyncKeyState(VK_CAPITAL.0 as i32) as u16 & 0x8000) != 0;
         let oem_attn_down = (GetAsyncKeyState(VK_OEM_ATTN_CODE as i32) as u16 & 0x8000) != 0;
@@ -143,6 +173,7 @@ fn get_active_flag(vk: u32) -> Option<&'static AtomicBool> {
 /// CapsLock解放時の状態リセットおよびシミュレート中キーの安全解放 (KeyUp送信)
 pub fn reset_caps_state() {
     CAPS_PRESSED.store(false, Ordering::SeqCst);
+    RAW_INPUT_CAPS_DOWN.store(false, Ordering::SeqCst);
     if ACTIVE_I.swap(false, Ordering::SeqCst) { send_simulated_key(VK_UP, true); }
     if ACTIVE_J.swap(false, Ordering::SeqCst) { send_simulated_key(VK_LEFT, true); }
     if ACTIVE_K.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DOWN, true); }
@@ -181,7 +212,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
         if is_capslock_key(kbd.vkCode, kbd.scanCode, kbd.flags.0) {
             if is_down {
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
+                RAW_INPUT_CAPS_DOWN.store(true, Ordering::SeqCst);
             } else if is_up {
+                RAW_INPUT_CAPS_DOWN.store(false, Ordering::SeqCst);
                 reset_caps_state();
                 ensure_capslock_off();
             }
@@ -258,6 +291,86 @@ fn send_simulated_key(vk: VIRTUAL_KEY, is_up: bool) {
     }
 }
 
+/// Raw Input メッセージ処理用ウィンドウプロシージャ
+unsafe extern "system" fn raw_input_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if msg == WM_INPUT {
+        handle_raw_input(HRAWINPUT(l_param.0 as _));
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, w_param, l_param)
+}
+
+/// Raw Input データを受信し、ハードウェア層での CapsLock (スキャンコード 0x3A) の押下・解放を捕捉
+unsafe fn handle_raw_input(h_raw: HRAWINPUT) {
+    let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+
+    // 64bitアライメントを保証したスタックバッファ (RAWINPUT は約48バイト)
+    #[repr(C, align(8))]
+    struct RawInputBuffer {
+        data: [u8; 128],
+    }
+    let mut buf = RawInputBuffer { data: [0u8; 128] };
+    let mut size = buf.data.len() as u32;
+
+    let copied = GetRawInputData(
+        h_raw,
+        RID_INPUT,
+        Some(buf.data.as_mut_ptr() as *mut _),
+        &mut size,
+        header_size,
+    );
+
+    // バッファサイズが不足していた場合のヒープフォールバック
+    let mut heap_buf: Vec<u8>;
+    let data_ptr = if copied == u32::MAX && size > buf.data.len() as u32 {
+        heap_buf = vec![0u8; size as usize];
+        let res = GetRawInputData(
+            h_raw,
+            RID_INPUT,
+            Some(heap_buf.as_mut_ptr() as *mut _),
+            &mut size,
+            header_size,
+        );
+        if res == u32::MAX || res == 0 {
+            return;
+        }
+        heap_buf.as_ptr()
+    } else if copied == u32::MAX || copied == 0 {
+        return;
+    } else {
+        buf.data.as_ptr()
+    };
+
+    let raw = &*(data_ptr as *const RAWINPUT);
+    if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+        let kb = &raw.data.keyboard;
+        // スキャンコード 0x3A (CapsLock / 英数) かつ E0拡張キーでないことを判定
+        // または仮想キーコードが VK_CAPITAL / VK_OEM_ATTN
+        let is_caps = (kb.MakeCode as u32 == SCANCODE_CAPSLOCK && (kb.Flags & RI_KEY_E0 == 0))
+            || kb.VKey == VK_CAPITAL.0
+            || kb.VKey == VK_OEM_ATTN_CODE as u16;
+
+        if is_caps {
+            let is_break = (kb.Flags & RI_KEY_BREAK) != 0;
+            if is_break {
+                log::debug!("RawInput: CapsLock (0x3A) 物理解放検知 -> ナビゲーション解除");
+                RAW_INPUT_CAPS_DOWN.store(false, Ordering::SeqCst);
+                reset_caps_state();
+                ensure_capslock_off();
+            } else {
+                log::debug!("RawInput: CapsLock (0x3A) 物理押下検知 -> ホールド開始");
+                RAW_INPUT_CAPS_DOWN.store(true, Ordering::SeqCst);
+                CAPS_PRESSED.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 /// Windows フックループの実行
 pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
@@ -279,6 +392,55 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
 
         // フック開始直後に CapsLock が ON になっていれば OFF にリセット
         ensure_capslock_off();
+
+        // Raw Input 用不可視トップレベルウィンドウの作成とデバイス登録
+        let class_name: Vec<u16> = "CapsNavRawInputClass\0".encode_utf16().collect();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: WNDCLASS_STYLES(0),
+            lpfnWndProc: Some(raw_input_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: h_instance,
+            hIcon: HICON::default(),
+            hCursor: HCURSOR::default(),
+            hbrBackground: HBRUSH::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            hIconSm: HICON::default(),
+        };
+        let _ = RegisterClassExW(&wc);
+
+        // 親ウィンドウを NULL (HWND::default) にし、WS_POPUP でトップレベルウィンドウを作成
+        // (WS_VISIBLE を付与しないため完全不可視で動作し、RIDEV_INPUTSINK による他アプリ前面時入力を確実に受信)
+        let hwnd_raw = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            HWND::default(),
+            HMENU::default(),
+            h_instance,
+            None,
+        ).unwrap_or_default();
+
+        let rid = RAWINPUTDEVICE {
+            usUsagePage: 0x01, // Generic Desktop Controls
+            usUsage: 0x06,     // Keyboard
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd_raw,
+        };
+        if RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok() {
+            RAW_INPUT_ACTIVE.store(true, Ordering::SeqCst);
+            log::info!("Raw Input キーボードデバイスを登録しました (トップレベル監視有効)");
+        } else {
+            RAW_INPUT_ACTIVE.store(false, Ordering::SeqCst);
+            log::warn!("Raw Input キーボードデバイスの登録に失敗しました。フォールバック機構を使用します。");
+        }
 
         // CapsLock物理解放を監視する軽量バックグラウンドスレッドを起動
         WATCHER_RUNNING.store(true, Ordering::SeqCst);
@@ -307,8 +469,15 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
             DispatchMessageW(&msg);
         }
 
-        // 監視スレッドの停止
+        // 監視スレッドおよび Raw Input の停止
         WATCHER_RUNNING.store(false, Ordering::SeqCst);
+        RAW_INPUT_ACTIVE.store(false, Ordering::SeqCst);
+        RAW_INPUT_CAPS_DOWN.store(false, Ordering::SeqCst);
+
+        // Raw Input ウィンドウの安全破棄
+        if !hwnd_raw.0.is_null() {
+            let _ = DestroyWindow(hwnd_raw);
+        }
 
         // 終了時のアンフック処理
         let handle_val = HOOK_HANDLE.swap(0, Ordering::SeqCst);
@@ -324,6 +493,8 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
 /// シグナルハンドラ等からフックループを安全に停止
 pub fn stop_hook() {
     WATCHER_RUNNING.store(false, Ordering::SeqCst);
+    RAW_INPUT_ACTIVE.store(false, Ordering::SeqCst);
+    RAW_INPUT_CAPS_DOWN.store(false, Ordering::SeqCst);
     let thread_id = MAIN_THREAD_ID.load(Ordering::SeqCst);
     if thread_id != 0 {
         unsafe {
@@ -464,6 +635,8 @@ mod tests {
     fn test_vk_constants() {
         assert_eq!(SCANCODE_CAPSLOCK, 0x3A);
         assert_eq!(VK_OEM_ATTN_CODE, 0xF0);
+        assert_eq!(RI_KEY_BREAK, 1);
+        assert_eq!(RI_KEY_E0, 2);
     }
 
     #[test]
@@ -473,11 +646,30 @@ mod tests {
     }
 
     #[test]
+    fn test_is_capslock_physically_down_with_raw_input() {
+        // Raw Input アクティブ時、RAW_INPUT_CAPS_DOWN が反映されることを検証
+        RAW_INPUT_ACTIVE.store(true, Ordering::SeqCst);
+        RAW_INPUT_CAPS_DOWN.store(true, Ordering::SeqCst);
+        assert!(is_capslock_physically_down());
+
+        RAW_INPUT_CAPS_DOWN.store(false, Ordering::SeqCst);
+        // VK_CAPITAL が物理押下されていなければ false となる
+        let _ = is_capslock_physically_down();
+
+        RAW_INPUT_ACTIVE.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
     fn test_reset_caps_state() {
         CAPS_PRESSED.store(true, Ordering::SeqCst);
+        RAW_INPUT_CAPS_DOWN.store(true, Ordering::SeqCst);
+        ACTIVE_I.store(true, Ordering::SeqCst);
         assert!(CAPS_PRESSED.load(Ordering::SeqCst));
+        assert!(RAW_INPUT_CAPS_DOWN.load(Ordering::SeqCst));
 
         reset_caps_state();
         assert!(!CAPS_PRESSED.load(Ordering::SeqCst));
+        assert!(!RAW_INPUT_CAPS_DOWN.load(Ordering::SeqCst));
+        assert!(!ACTIVE_I.load(Ordering::SeqCst));
     }
 }
