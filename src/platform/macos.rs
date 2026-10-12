@@ -47,7 +47,6 @@ pub const NX_ALPHASHIFT_STATELESS_MASK: u64 = 0x01000000;
 pub const NX_DEVICE_ALPHASHIFT_STATELESS_MASK: u64 = 0x00000080;
 
 pub const K_CG_HID_EVENT_TAP: u32 = 0;
-pub const K_CG_SESSION_EVENT_TAP: u32 = 1;
 pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 pub const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
@@ -386,5 +385,12 @@ mod tests {
         // 矢印キーは常に有効
         assert_eq!(macos_keycode_to_navigation(KEY_I, false), Some(KEY_ARROW_UP));
         assert_eq!(macos_keycode_to_navigation(KEY_I, true), Some(KEY_ARROW_UP));
+    }
+
+    #[test]
+    fn test_event_tap_constants() {
+        assert_eq!(K_CG_HID_EVENT_TAP, 0);
+        assert_eq!(K_CG_HEAD_INSERT_EVENT_TAP, 0);
+        assert_eq!(K_CG_EVENT_TAP_OPTION_DEFAULT, 0);
     }
 }
