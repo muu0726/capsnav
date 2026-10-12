@@ -56,12 +56,12 @@ impl DashboardWindow {
     }
 }
 
-fn get_dashboard_html() -> String {
+pub fn get_dashboard_html() -> String {
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     DASHBOARD_HTML_TEMPLATE.replace("{{VERSION}}", &version)
 }
 
-const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="UTF-8">

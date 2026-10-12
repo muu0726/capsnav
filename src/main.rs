@@ -1,12 +1,7 @@
 // Windowsでリリースビルド時にコンソール画面を非表示にする
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod autolaunch;
-mod common;
-mod platform;
-mod single_instance;
-mod tray;
-mod window;
+use capsnav::{autolaunch, common, platform, single_instance, tray, window};
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
