@@ -46,6 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
+    // 起動時に CapsLock が ON になっている場合は OFF にリセット
+    platform::ensure_capslock_off();
+
     // 2. Tao イベントループの初期化
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
@@ -151,6 +154,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if menu_event.id == tray_components.enabled_item.id() {
                     let is_checked = tray_components.enabled_item.is_checked();
                     common::set_enabled(is_checked);
+                    if is_checked {
+                        platform::ensure_capslock_off();
+                    }
                     log::info!("キー変換有効状態を変更しました (トレイ経由): {}", is_checked);
 
                     let new_status = if is_checked {
@@ -183,6 +189,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if msg.contains(r#""action":"toggle_enabled""#) {
                     let new_val = msg.contains(r#""value":true"#);
                     common::set_enabled(new_val);
+                    if new_val {
+                        platform::ensure_capslock_off();
+                    }
                     tray_components.enabled_item.set_checked(new_val);
 
                     let new_status = if new_val {

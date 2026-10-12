@@ -46,9 +46,15 @@ pub const K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 0x00010000;
 pub const NX_ALPHASHIFT_STATELESS_MASK: u64 = 0x01000000;
 pub const NX_DEVICE_ALPHASHIFT_STATELESS_MASK: u64 = 0x00000080;
 
-pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+pub const K_CG_HID_EVENT_TAP: u32 = 0;
 pub const K_CG_SESSION_EVENT_TAP: u32 = 1;
+pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 pub const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
+
+/// macOS 環境における CapsLock 状態のリセット (必要時のプレースホルダ)
+pub fn ensure_capslock_off() {
+    // macOS では kCGHIDEventTap によるハードウェアレベルでの破棄により制御
+}
 
 static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
 static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -259,7 +265,7 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
             | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
         let port = CGEventTapCreate(
-            K_CG_SESSION_EVENT_TAP,
+            K_CG_HID_EVENT_TAP,
             K_CG_HEAD_INSERT_EVENT_TAP,
             K_CG_EVENT_TAP_OPTION_DEFAULT,
             event_mask,

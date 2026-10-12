@@ -2,9 +2,10 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CAPITAL, VK_DELETE,
     VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
     VIRTUAL_KEY,
@@ -25,6 +26,37 @@ static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
 /// フックハンドル（プロセス終了時の安全なクリーンアップ用）
 static HOOK_HANDLE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// CapsLockの標準ハードウェアスキャンコード (AT / PS/2 / USB HID共通)
+pub const SCANCODE_CAPSLOCK: u32 = 0x3A;
+
+/// 日本語キーボードにおける「英数 (CapsLock)」キー単体押下時の仮想キーコード
+pub const VK_OEM_ATTN_CODE: u32 = 0xF0;
+
+/// CapsLockキー（英語配列・日本語配列の英数キーを含む）であるかを判定する純粋関数
+pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
+    // 仮想キーコードが VK_CAPITAL または VK_OEM_ATTN の場合は明示的なCapsLock/英数キー
+    if vk_code == VK_CAPITAL.0 as u32 || vk_code == VK_OEM_ATTN_CODE {
+        return true;
+    }
+
+    // スキャンコード 0x3A の場合、拡張キーフラグ (LLKHF_EXTENDED = 0x01) が立っていなければ CapsLock
+    let is_extended = (flags & 1) != 0;
+    !is_extended && scan_code == SCANCODE_CAPSLOCK
+}
+
+/// CapsLockが現在ON（大文字固定）状態であれば、擬似イベントを送信して安全にOFFへリセット
+pub fn ensure_capslock_off() {
+    unsafe {
+        let state = GetKeyState(VK_CAPITAL.0 as i32);
+        // 最下位ビットが1であればCapsLockトグルがON状態
+        if (state & 1) != 0 {
+            log::info!("CapsLockがON状態であることを検出しました。OFFへリセットします。");
+            send_simulated_key(VK_CAPITAL, false);
+            send_simulated_key(VK_CAPITAL, true);
+        }
+    }
+}
 
 // ナビゲーションキーの Virtual Key Code
 pub const VK_I: u32 = 0x49;
@@ -107,8 +139,8 @@ unsafe extern "system" fn low_level_keyboard_proc(
         let is_down = msg_type == WM_KEYDOWN || msg_type == WM_SYSKEYDOWN;
         let is_up = msg_type == WM_KEYUP || msg_type == WM_SYSKEYUP;
 
-        // 3. CapsLockの捕捉と完全遮断（OSの大文字トグル / LED点灯を完全に防止）
-        if kbd.vkCode == VK_CAPITAL.0 as u32 {
+        // 3. CapsLockの捕捉と完全遮断（OSの大文字トグル / LED点灯 / IME英数切り替えを完全に防止）
+        if is_capslock_key(kbd.vkCode, kbd.scanCode, kbd.flags.0) {
             if is_down {
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
             } else if is_up {
@@ -184,13 +216,21 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
         let thread_id = GetCurrentThreadId();
         MAIN_THREAD_ID.store(thread_id, Ordering::SeqCst);
 
+        let h_instance = match GetModuleHandleW(None) {
+            Ok(handle) => HINSTANCE(handle.0),
+            Err(_) => HINSTANCE::default(),
+        };
+
         let hook = SetWindowsHookExW(
             WH_KEYBOARD_LL,
             Some(low_level_keyboard_proc),
-            HINSTANCE::default(),
+            h_instance,
             0,
         )?;
         HOOK_HANDLE.store(hook.0 as isize, Ordering::SeqCst);
+
+        // フック開始直後に CapsLock が ON になっていれば OFF にリセット
+        ensure_capslock_off();
 
         log::info!("Windows WH_KEYBOARD_LL フックを開始しました (CapsLock + IJKL -> 矢印)");
 
@@ -293,5 +333,34 @@ mod tests {
         // 矢印キーは常に有効
         assert_eq!(vk_to_navigation(VK_I, false), Some(VK_UP));
         assert_eq!(vk_to_navigation(VK_I, true), Some(VK_UP));
+    }
+
+    #[test]
+    fn test_is_capslock_key() {
+        // 標準 US CapsLock (0x14, 0x3A, non-extended)
+        assert!(is_capslock_key(VK_CAPITAL.0 as u32, SCANCODE_CAPSLOCK, 0));
+        assert!(is_capslock_key(VK_CAPITAL.0 as u32, 0, 0));
+
+        // 日本語 106/109 CapsLock / 英数 単体押下 (0xF0, 0x3A, non-extended)
+        assert!(is_capslock_key(VK_OEM_ATTN_CODE, SCANCODE_CAPSLOCK, 0));
+        assert!(is_capslock_key(VK_OEM_ATTN_CODE, 0, 0));
+
+        // スキャンコード 0x3A のみでの押下
+        assert!(is_capslock_key(0, SCANCODE_CAPSLOCK, 0));
+
+        // 拡張キーフラグが立っている場合はスキャンコード 0x3A のみでは不一致 (他キーとの誤判定防止)
+        assert!(!is_capslock_key(0, SCANCODE_CAPSLOCK, 1));
+
+        // 明示的な VK_CAPITAL / VK_OEM_ATTN の場合はフラグに関わらず一致
+        assert!(is_capslock_key(VK_CAPITAL.0 as u32, SCANCODE_CAPSLOCK, 1));
+        assert!(is_capslock_key(VK_OEM_ATTN_CODE, SCANCODE_CAPSLOCK, 1));
+
+        // 通常文字キーおよびナビゲーション対象キー
+        assert!(!is_capslock_key(VK_I, 0x17, 0));
+        assert!(!is_capslock_key(VK_J, 0x24, 0));
+        assert!(!is_capslock_key(VK_K, 0x25, 0));
+        assert!(!is_capslock_key(VK_L, 0x26, 0));
+        assert!(!is_capslock_key(0x20, 0x39, 0)); // Space
+        assert!(!is_capslock_key(0x0D, 0x1C, 0)); // Enter
     }
 }
