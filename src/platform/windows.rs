@@ -18,9 +18,9 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, PostThreadMessageW, RegisterClassExW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HCURSOR, HHOOK, HICON, HMENU, KBDLLHOOKSTRUCT, MSG,
-    WH_KEYBOARD_LL, WINDOW_EX_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
-    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WNDCLASS_STYLES, WS_POPUP,
+    UnhookWindowsHookEx, UnregisterClassW, HCURSOR, HHOOK, HICON, HMENU,
+    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WM_INPUT, WM_KEYDOWN,
+    WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WNDCLASS_STYLES, WS_POPUP,
 };
 
 use crate::common::INJECTED_SIGNATURE;
@@ -300,13 +300,17 @@ unsafe extern "system" fn raw_input_wndproc(
 ) -> LRESULT {
     if msg == WM_INPUT {
         handle_raw_input(HRAWINPUT(l_param.0 as _));
-        return LRESULT(0);
     }
+    // MSDN 仕様に準拠: WM_INPUT 処理後も DefWindowProcW を呼び出すことで OS 内部の Raw Input バッファを解放
     DefWindowProcW(hwnd, msg, w_param, l_param)
 }
 
 /// Raw Input データを受信し、ハードウェア層での CapsLock (スキャンコード 0x3A) の押下・解放を捕捉
 unsafe fn handle_raw_input(h_raw: HRAWINPUT) {
+    if h_raw.0.is_null() {
+        return;
+    }
+
     let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
 
     // 64bitアライメントを保証したスタックバッファ (RAWINPUT は約48バイト)
@@ -349,6 +353,12 @@ unsafe fn handle_raw_input(h_raw: HRAWINPUT) {
     let raw = &*(data_ptr as *const RAWINPUT);
     if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
         let kb = &raw.data.keyboard;
+
+        // 自身がシミュレート注入したイベントは即座に除外（誤判定・自己誘発ループ防止）
+        if kb.ExtraInformation == INJECTED_SIGNATURE as u32 {
+            return;
+        }
+
         // スキャンコード 0x3A (CapsLock / 英数) かつ E0拡張キーでないことを判定
         // または仮想キーコードが VK_CAPITAL / VK_OEM_ATTN
         let is_caps = (kb.MakeCode as u32 == SCANCODE_CAPSLOCK && (kb.Flags & RI_KEY_E0 == 0))
@@ -474,10 +484,11 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
         RAW_INPUT_ACTIVE.store(false, Ordering::SeqCst);
         RAW_INPUT_CAPS_DOWN.store(false, Ordering::SeqCst);
 
-        // Raw Input ウィンドウの安全破棄
+        // Raw Input ウィンドウの安全破棄およびクラス登録解除
         if !hwnd_raw.0.is_null() {
             let _ = DestroyWindow(hwnd_raw);
         }
+        let _ = UnregisterClassW(PCWSTR::from_raw(class_name.as_ptr()), h_instance);
 
         // 終了時のアンフック処理
         let handle_val = HOOK_HANDLE.swap(0, Ordering::SeqCst);
@@ -671,5 +682,18 @@ mod tests {
         assert!(!CAPS_PRESSED.load(Ordering::SeqCst));
         assert!(!RAW_INPUT_CAPS_DOWN.load(Ordering::SeqCst));
         assert!(!ACTIVE_I.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_handle_raw_input_null_safety() {
+        // NULL ハンドルを渡してもパニックしないことを検証
+        unsafe {
+            handle_raw_input(HRAWINPUT(std::ptr::null_mut()));
+        }
+    }
+
+    #[test]
+    fn test_injected_signature_filtering_constant() {
+        assert_eq!(INJECTED_SIGNATURE as u32, 0xCA95_4A40);
     }
 }
