@@ -1,11 +1,11 @@
-//! Windows プラットフォーム向けキーフック実装 (WH_KEYBOARD_LL + GetAsyncKeyState + SendInput)
+//! Windows プラットフォーム向けキーフック実装 (WH_KEYBOARD_LL + SendInput)
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CAPITAL, VK_DELETE, VK_DOWN, VK_END, VK_HOME,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP, VIRTUAL_KEY,
 };
@@ -19,9 +19,6 @@ use crate::common::INJECTED_SIGNATURE;
 
 /// CapsLockが押下されているかどうかの状態フラグ
 static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
-
-/// 解放監視スレッドの実行状態フラグ
-static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// フックが登録されたメインスレッドのID（安全な終了通知用）
 static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -45,19 +42,6 @@ pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
     // スキャンコード 0x3A の場合、拡張キーフラグ (LLKHF_EXTENDED = 0x01) が立っていなければ CapsLock
     let is_extended = (flags & 1) != 0;
     !is_extended && scan_code == SCANCODE_CAPSLOCK
-}
-
-/// CapsLock（または日本語キーボードの英数キー）が現在物理的に押下されているかを判定する純粋関数
-///
-/// Windows OS の GetAsyncKeyState API を使用し、キーボードドライバ/HID割り込み層での
-/// 物理ハードウェア押下状態（最上位ビット 0x8000）をリアルタイムに直接照合します。
-/// US配列 (VK_CAPITAL = 0x14) および 日本語配列 (VK_OEM_ATTN = 0xF0) の双方に対応します。
-pub fn is_capslock_physically_down() -> bool {
-    unsafe {
-        let capital_down = (GetAsyncKeyState(VK_CAPITAL.0 as i32) as u16 & 0x8000) != 0;
-        let oem_attn_down = (GetAsyncKeyState(VK_OEM_ATTN_CODE as i32) as u16 & 0x8000) != 0;
-        capital_down || oem_attn_down
-    }
 }
 
 /// CapsLock状態を安全にリセットするための通常キー判定
@@ -187,7 +171,6 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
             } else if is_up {
                 reset_caps_state();
-                ensure_capslock_off();
             }
             // LRESULT(1) を返すことで、OSおよび他アプリへのキー伝播を完全に遮断
             return LRESULT(1);
@@ -198,18 +181,10 @@ unsafe extern "system" fn low_level_keyboard_proc(
         if let Some(target_vk) = vk_to_navigation(kbd.vkCode, allow_extended) {
             if let Some(active_flag) = get_active_flag(kbd.vkCode) {
                 if is_down {
-                    // CapsLockが物理的に押下中であるかを直接検証
-                    if is_capslock_physically_down() {
-                        CAPS_PRESSED.store(true, Ordering::SeqCst);
+                    if CAPS_PRESSED.load(Ordering::SeqCst) {
                         active_flag.store(true, Ordering::SeqCst);
                         send_simulated_key(target_vk, false);
                         return LRESULT(1);
-                    } else {
-                        // CapsLockが物理的に押されていない場合、残留状態を直ちにリセットして通常キーとして通過
-                        if CAPS_PRESSED.swap(false, Ordering::SeqCst) {
-                            reset_caps_state();
-                            ensure_capslock_off();
-                        }
                     }
                 } else if is_up {
                     // 既に変換キーとして押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
@@ -221,14 +196,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
             }
         } else if is_down && is_fallback_recovery_key(kbd.vkCode) {
             // 5. フォールバック保護: ナビゲーション対象外の一般キーが押下された際、
-            // CapsLockが物理的に押されていなければ残留した CAPS_PRESSED を安全解除
-            if !is_capslock_physically_down() && CAPS_PRESSED.swap(false, Ordering::SeqCst) {
+            // CapsLock状態の残留（Alt+Tab等のフォーカス喪失によるKeyUp取りこぼし）があれば安全に解除
+            if CAPS_PRESSED.swap(false, Ordering::SeqCst) {
                 log::debug!(
-                    "通常キー(0x{:02X})押下によりCapsLock状態の残留を検知・リセット",
+                    "通常キー(0x{:02X})押下によりCapsLockホールド状態を安全解除",
                     kbd.vkCode
                 );
                 reset_caps_state();
-                ensure_capslock_off();
             }
         }
     }
@@ -284,27 +258,6 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
         // フック開始直後に CapsLock が ON になっていれば OFF にリセット
         ensure_capslock_off();
 
-        // CapsLock物理解放を監視する軽量バックグラウンドスレッドを起動
-        // JISキーボード等で WM_KEYUP がフックに配送されない環境でも、
-        // ハードウェアレベルの解放（GetAsyncKeyState = 0）を 15ms 以内に検知して即時解除
-        WATCHER_RUNNING.store(true, Ordering::SeqCst);
-        let _watcher_thread = std::thread::Builder::new()
-            .name("caps-release-watcher".to_string())
-            .spawn(|| {
-                while WATCHER_RUNNING.load(Ordering::SeqCst) {
-                    if CAPS_PRESSED.load(Ordering::SeqCst) {
-                        if !is_capslock_physically_down() {
-                            log::debug!("CapsLock 物理解放を検知 (Watcher) -> ナビゲーション解除");
-                            reset_caps_state();
-                            ensure_capslock_off();
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(15));
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                }
-            });
-
         log::info!("Windows WH_KEYBOARD_LL フックを開始しました (CapsLock + IJKL -> 矢印)");
 
         let mut msg = MSG::default();
@@ -312,9 +265,6 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             DispatchMessageW(&msg);
         }
-
-        // 監視スレッドの停止
-        WATCHER_RUNNING.store(false, Ordering::SeqCst);
 
         // 終了時のアンフック処理
         let handle_val = HOOK_HANDLE.swap(0, Ordering::SeqCst);
@@ -329,7 +279,6 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
 
 /// シグナルハンドラ等からフックループを安全に停止
 pub fn stop_hook() {
-    WATCHER_RUNNING.store(false, Ordering::SeqCst);
     let thread_id = MAIN_THREAD_ID.load(Ordering::SeqCst);
     if thread_id != 0 {
         unsafe {
@@ -470,12 +419,6 @@ mod tests {
     fn test_vk_constants() {
         assert_eq!(SCANCODE_CAPSLOCK, 0x3A);
         assert_eq!(VK_OEM_ATTN_CODE, 0xF0);
-    }
-
-    #[test]
-    fn test_is_capslock_physically_down_callable() {
-        // テスト実行環境において呼び出し可能であり、パニックを起こさないことを検証
-        let _ = is_capslock_physically_down();
     }
 
     #[test]
