@@ -1,7 +1,9 @@
-//! Windows プラットフォーム向けキーフック実装 (WH_KEYBOARD_LL + SendInput)
+//! Windows プラットフォーム向けキーフック実装 (WH_KEYBOARD_LL + Raw Input + SendInput)
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -10,16 +12,26 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
     VIRTUAL_KEY,
 };
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
+    RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, PostThreadMessageW, RegisterClassExW, SetWindowsHookExW,
+    UnhookWindowsHookEx, HCURSOR, HHOOK, HICON, HMENU, HWND_MESSAGE,
+    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WNDCLASSEXW, WNDCLASS_STYLES,
 };
 
 use crate::common::INJECTED_SIGNATURE;
 
 /// CapsLockが物理的に押下されているかどうかの状態フラグ
 static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Raw Input によるキーボード監視が正常に有効化されているかどうかのフラグ
+static RAW_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// フックが登録されたメインスレッドのID（安全な終了通知用）
 static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -33,6 +45,12 @@ pub const SCANCODE_CAPSLOCK: u32 = 0x3A;
 /// 日本語キーボードにおける「英数 (CapsLock)」キー単体押下時の仮想キーコード
 pub const VK_OEM_ATTN_CODE: u32 = 0xF0;
 
+/// Raw Input のキー解放 (Break) フラグ: RAWKEYBOARD.Flags bit 0 (0 = Make, 1 = Break)
+pub const RI_KEY_BREAK: u16 = 1;
+
+/// Raw Input の E0 拡張プレフィックスフラグ: RAWKEYBOARD.Flags bit 1
+pub const RI_KEY_E0: u16 = 2;
+
 /// CapsLockキー（英語配列・日本語配列の英数キーを含む）であるかを判定する純粋関数
 pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
     // 仮想キーコードが VK_CAPITAL または VK_OEM_ATTN の場合は明示的なCapsLock/英数キー
@@ -43,6 +61,19 @@ pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
     // スキャンコード 0x3A の場合、拡張キーフラグ (LLKHF_EXTENDED = 0x01) が立っていなければ CapsLock
     let is_extended = (flags & 1) != 0;
     !is_extended && scan_code == SCANCODE_CAPSLOCK
+}
+
+/// Raw Input が利用できない環境において、CapsLock状態を安全にリセットするための通常キー判定
+pub fn is_fallback_recovery_key(vk_code: u32) -> bool {
+    // 修飾キー（Shift, Ctrl, Alt, Win）および CapsLock 自体は除外
+    !matches!(
+        vk_code,
+        0x10 | 0xA0 | 0xA1 // Shift (VK_SHIFT, VK_LSHIFT, VK_RSHIFT)
+        | 0x11 | 0xA2 | 0xA3 // Ctrl (VK_CONTROL, VK_LCONTROL, VK_RCONTROL)
+        | 0x12 | 0xA4 | 0xA5 // Alt (VK_MENU, VK_LMENU, VK_RMENU)
+        | 0x5B | 0x5C // Win (VK_LWIN, VK_RWIN)
+        | 0x14 | 0xF0 // VK_CAPITAL, VK_OEM_ATTN
+    )
 }
 
 /// CapsLockが現在ON（大文字固定）状態であれば、擬似イベントを送信して安全にOFFへリセット
@@ -116,6 +147,20 @@ fn get_active_flag(vk: u32) -> Option<&'static AtomicBool> {
     }
 }
 
+/// CapsLock解放時の状態リセットおよびシミュレート中キーの安全解放 (KeyUp送信)
+pub fn reset_caps_state() {
+    CAPS_PRESSED.store(false, Ordering::SeqCst);
+    if ACTIVE_I.swap(false, Ordering::SeqCst) { send_simulated_key(VK_UP, true); }
+    if ACTIVE_J.swap(false, Ordering::SeqCst) { send_simulated_key(VK_LEFT, true); }
+    if ACTIVE_K.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DOWN, true); }
+    if ACTIVE_L.swap(false, Ordering::SeqCst) { send_simulated_key(VK_RIGHT, true); }
+    if ACTIVE_U.swap(false, Ordering::SeqCst) { send_simulated_key(VK_HOME, true); }
+    if ACTIVE_O.swap(false, Ordering::SeqCst) { send_simulated_key(VK_END, true); }
+    if ACTIVE_H.swap(false, Ordering::SeqCst) { send_simulated_key(VK_PRIOR, true); }
+    if ACTIVE_N.swap(false, Ordering::SeqCst) { send_simulated_key(VK_NEXT, true); }
+    if ACTIVE_BACK.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DELETE, true); }
+}
+
 /// 低レベルキーボードフックコールバック
 unsafe extern "system" fn low_level_keyboard_proc(
     n_code: i32,
@@ -144,17 +189,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
             if is_down {
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
             } else if is_up {
-                CAPS_PRESSED.store(false, Ordering::SeqCst);
-                // CapsLock離脱時、残存しているナビゲーションキーがあれば安全に離脱(KEYUP)を送信
-                if ACTIVE_I.swap(false, Ordering::SeqCst) { send_simulated_key(VK_UP, true); }
-                if ACTIVE_J.swap(false, Ordering::SeqCst) { send_simulated_key(VK_LEFT, true); }
-                if ACTIVE_K.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DOWN, true); }
-                if ACTIVE_L.swap(false, Ordering::SeqCst) { send_simulated_key(VK_RIGHT, true); }
-                if ACTIVE_U.swap(false, Ordering::SeqCst) { send_simulated_key(VK_HOME, true); }
-                if ACTIVE_O.swap(false, Ordering::SeqCst) { send_simulated_key(VK_END, true); }
-                if ACTIVE_H.swap(false, Ordering::SeqCst) { send_simulated_key(VK_PRIOR, true); }
-                if ACTIVE_N.swap(false, Ordering::SeqCst) { send_simulated_key(VK_NEXT, true); }
-                if ACTIVE_BACK.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DELETE, true); }
+                reset_caps_state();
             }
             // LRESULT(1) を返すことで、OSおよび他アプリへのキー伝播を完全に遮断
             return LRESULT(1);
@@ -177,6 +212,16 @@ unsafe extern "system" fn low_level_keyboard_proc(
                         return LRESULT(1);
                     }
                 }
+            }
+        } else if is_down && !RAW_INPUT_ACTIVE.load(Ordering::SeqCst) && is_fallback_recovery_key(kbd.vkCode) {
+            // 5. フォールバック保護: Raw Input が稼働していない環境において、
+            // ナビゲーション対象外の一般キーが押下された場合に残留した CAPS_PRESSED を安全解除
+            if CAPS_PRESSED.swap(false, Ordering::SeqCst) {
+                log::debug!(
+                    "Raw Input未稼働環境でのフォールバック発動: 通常キー(0x{:02X})押下によりCapsLock状態をリセット",
+                    kbd.vkCode
+                );
+                reset_caps_state();
             }
         }
     }
@@ -210,6 +255,77 @@ fn send_simulated_key(vk: VIRTUAL_KEY, is_up: bool) {
     }
 }
 
+/// Raw Input メッセージ処理用ウィンドウプロシージャ
+unsafe extern "system" fn raw_input_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if msg == WM_INPUT {
+        handle_raw_input(HRAWINPUT(l_param.0 as _));
+    }
+    DefWindowProcW(hwnd, msg, w_param, l_param)
+}
+
+/// Raw Input データを受信し、ハードウェア層での CapsLock (スキャンコード 0x3A) の押下・解放を捕捉
+unsafe fn handle_raw_input(h_raw: HRAWINPUT) {
+    let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+
+    // 64bitアライメントを保証したスタックバッファ (RAWINPUT は約48バイト)
+    #[repr(C, align(8))]
+    struct RawInputBuffer {
+        data: [u8; 128],
+    }
+    let mut buf = RawInputBuffer { data: [0u8; 128] };
+    let mut size = buf.data.len() as u32;
+
+    let copied = GetRawInputData(
+        h_raw,
+        RID_INPUT,
+        Some(buf.data.as_mut_ptr() as *mut _),
+        &mut size,
+        header_size,
+    );
+
+    // バッファサイズが不足していた場合のヒープフォールバック
+    let mut heap_buf: Vec<u8>;
+    let data_ptr = if copied == u32::MAX && size > buf.data.len() as u32 {
+        heap_buf = vec![0u8; size as usize];
+        let res = GetRawInputData(
+            h_raw,
+            RID_INPUT,
+            Some(heap_buf.as_mut_ptr() as *mut _),
+            &mut size,
+            header_size,
+        );
+        if res == u32::MAX || res == 0 {
+            return;
+        }
+        heap_buf.as_ptr()
+    } else if copied == u32::MAX || copied == 0 {
+        return;
+    } else {
+        buf.data.as_ptr()
+    };
+
+    let raw = &*(data_ptr as *const RAWINPUT);
+    if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+        let kb = &raw.data.keyboard;
+        // スキャンコード 0x3A (CapsLock / 英数) かつ E0拡張キーでないことを判定
+        if kb.MakeCode as u32 == SCANCODE_CAPSLOCK && (kb.Flags & RI_KEY_E0 == 0) {
+            let is_break = (kb.Flags & RI_KEY_BREAK) != 0;
+            if is_break {
+                log::debug!("RawInput: CapsLock (0x3A) 物理解放検知 -> ナビゲーション解除");
+                reset_caps_state();
+            } else {
+                log::debug!("RawInput: CapsLock (0x3A) 物理押下検知 -> ホールド開始");
+                CAPS_PRESSED.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 /// Windows フックループの実行
 pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
@@ -234,10 +350,64 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
 
         log::info!("Windows WH_KEYBOARD_LL フックを開始しました (CapsLock + IJKL -> 矢印)");
 
+        // Raw Input 用メッセージ専用ウィンドウ (HWND_MESSAGE) の作成とデバイス登録
+        let class_name: Vec<u16> = "CapsNavRawInputClass\0".encode_utf16().collect();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: WNDCLASS_STYLES(0),
+            lpfnWndProc: Some(raw_input_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: h_instance,
+            hIcon: HICON::default(),
+            hCursor: HCURSOR::default(),
+            hbrBackground: HBRUSH::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            hIconSm: HICON::default(),
+        };
+        let _ = RegisterClassExW(&wc);
+
+        let hwnd_raw = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::null(),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            HMENU::default(),
+            h_instance,
+            None,
+        ).unwrap_or_default();
+
+        let rid = RAWINPUTDEVICE {
+            usUsagePage: 0x01, // Generic Desktop Controls
+            usUsage: 0x06,     // Keyboard
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd_raw,
+        };
+        if RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok() {
+            RAW_INPUT_ACTIVE.store(true, Ordering::SeqCst);
+            log::info!("Raw Input キーボードデバイスを登録しました (JIS CapsLock解放検知有効)");
+        } else {
+            RAW_INPUT_ACTIVE.store(false, Ordering::SeqCst);
+            log::warn!("Raw Input キーボードデバイスの登録に失敗しました。フォールバック機構を使用します。");
+        }
+
         let mut msg = MSG::default();
         // GetMessageW は WM_QUIT を受信すると 0 を返してループを抜ける
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             DispatchMessageW(&msg);
+        }
+
+        RAW_INPUT_ACTIVE.store(false, Ordering::SeqCst);
+
+        // Raw Input ウィンドウの安全破棄
+        if !hwnd_raw.0.is_null() {
+            let _ = DestroyWindow(hwnd_raw);
         }
 
         // 終了時のアンフック処理
@@ -362,5 +532,47 @@ mod tests {
         assert!(!is_capslock_key(VK_L, 0x26, 0));
         assert!(!is_capslock_key(0x20, 0x39, 0)); // Space
         assert!(!is_capslock_key(0x0D, 0x1C, 0)); // Enter
+    }
+
+    #[test]
+    fn test_is_fallback_recovery_key() {
+        // 修飾キー（Shift, Ctrl, Alt, Win）および CapsLock はフォールバック対象外（false）
+        assert!(!is_fallback_recovery_key(0x10)); // Shift
+        assert!(!is_fallback_recovery_key(0xA0)); // LShift
+        assert!(!is_fallback_recovery_key(0xA1)); // RShift
+        assert!(!is_fallback_recovery_key(0x11)); // Ctrl
+        assert!(!is_fallback_recovery_key(0xA2)); // LCtrl
+        assert!(!is_fallback_recovery_key(0xA3)); // RCtrl
+        assert!(!is_fallback_recovery_key(0x12)); // Alt
+        assert!(!is_fallback_recovery_key(0xA4)); // LAlt
+        assert!(!is_fallback_recovery_key(0xA5)); // RAlt
+        assert!(!is_fallback_recovery_key(0x5B)); // LWin
+        assert!(!is_fallback_recovery_key(0x5C)); // RWin
+        assert!(!is_fallback_recovery_key(0x14)); // VK_CAPITAL
+        assert!(!is_fallback_recovery_key(0xF0)); // VK_OEM_ATTN
+
+        // 通常の文字・記号・操作キーはフォールバック対象（true）
+        assert!(is_fallback_recovery_key(0x41)); // 'A'
+        assert!(is_fallback_recovery_key(0x20)); // Space
+        assert!(is_fallback_recovery_key(0x0D)); // Enter
+        assert!(is_fallback_recovery_key(0x1B)); // Escape
+        assert!(is_fallback_recovery_key(0x09)); // Tab
+    }
+
+    #[test]
+    fn test_raw_input_constants() {
+        assert_eq!(RI_KEY_BREAK, 1);
+        assert_eq!(RI_KEY_E0, 2);
+        assert_eq!(SCANCODE_CAPSLOCK, 0x3A);
+        assert_eq!(VK_OEM_ATTN_CODE, 0xF0);
+    }
+
+    #[test]
+    fn test_reset_caps_state() {
+        CAPS_PRESSED.store(true, Ordering::SeqCst);
+        assert!(CAPS_PRESSED.load(Ordering::SeqCst));
+
+        reset_caps_state();
+        assert!(!CAPS_PRESSED.load(Ordering::SeqCst));
     }
 }
