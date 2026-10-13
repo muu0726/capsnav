@@ -64,6 +64,7 @@ fn test_export_dashboard_html_for_browser_test() {
 "#;
     html = html.replace("</body>", &format!("{}\n</body>", hud));
 
+    std::fs::create_dir_all("scratch").expect("Failed to create scratch directory");
     std::fs::write("scratch/dashboard_browser_test.html", html).expect("Failed to write test HTML");
     assert!(std::path::Path::new("scratch/dashboard_browser_test.html").exists());
 }
