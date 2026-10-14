@@ -13,6 +13,8 @@ pub type CFAllocatorRef = *mut c_void;
 pub type CFStringRef = *mut c_void;
 
 pub const KEY_CAPSLOCK: i64 = 57;
+pub const KEY_F18: i64 = 79;
+pub const KEY_F19: i64 = 80;
 pub const KEY_I: i64 = 34;
 pub const KEY_J: i64 = 38;
 pub const KEY_K: i64 = 40;
@@ -50,9 +52,62 @@ pub const K_CG_HID_EVENT_TAP: u32 = 0;
 pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 pub const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
-/// macOS 環境における CapsLock 状態のリセット (必要時のプレースホルダ)
+/// CapsLock キー (HID: 0x700000039) を仮想キー F18 (HID: 0x70000006D, KeyCode: 79) へリマップ
+/// これにより、macOS の CapsLock 大文字固定トグル動作やLED点灯、入力ソース切り替え競合をハードウェア層で完全遮断し、
+/// 純粋なホールド型修飾キー (Hyperキー) として扱えるようにします。
+pub fn apply_capslock_remap() {
+    let mapping_json = r#"{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x700000039,"HIDKeyboardModifierMappingDst":0x70000006D}]}"#;
+    let status = std::process::Command::new("hidutil")
+        .args(["property", "--set", mapping_json])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            log::info!("hidutil による CapsLock -> F18 (Hyperキー) リマップを適用しました。");
+        }
+        Ok(s) => {
+            log::warn!("hidutil リマップの適用が終了コード {:?} で終了しました。", s.code());
+        }
+        Err(e) => {
+            log::warn!("hidutil の実行に失敗しました: {}", e);
+        }
+    }
+}
+
+/// hidutil のキーリマップを初期状態（空）にリセット
+pub fn reset_capslock_remap() {
+    let status = std::process::Command::new("hidutil")
+        .args(["property", "--set", "{\"UserKeyMapping\":[]}"])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            log::info!("hidutil によるキーリマップをリセットしました。");
+        }
+        Ok(s) => {
+            log::warn!("hidutil リマップのリセットが終了コード {:?} で終了しました。", s.code());
+        }
+        Err(e) => {
+            log::warn!("hidutil リセットの実行に失敗しました: {}", e);
+        }
+    }
+}
+
+/// macOS 環境における CapsLock 状態のリセットおよび Hyperキーリマップ適用
 pub fn ensure_capslock_off() {
-    // macOS では kCGHIDEventTap によるハードウェアレベルでの破棄により制御
+    apply_capslock_remap();
+}
+
+/// 有効化/無効化切り替え時のプラットフォーム固有フック
+pub fn on_enabled_changed(enabled: bool) {
+    if enabled {
+        ensure_capslock_off();
+    } else {
+        reset_capslock_remap();
+    }
+}
+
+/// 指定されたキーコードがナビゲーション修飾トリガーキー (F18 / F19 / CapsLock) であるか
+pub fn is_trigger_key(keycode: i64) -> bool {
+    keycode == KEY_F18 || keycode == KEY_F19 || keycode == KEY_CAPSLOCK
 }
 
 static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
@@ -157,6 +212,18 @@ fn get_active_flag(keycode: i64) -> Option<&'static AtomicBool> {
     }
 }
 
+unsafe fn release_all_active_keys(flags: u64) {
+    if ACTIVE_I.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_UP, false, flags); }
+    if ACTIVE_J.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_LEFT, false, flags); }
+    if ACTIVE_K.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_DOWN, false, flags); }
+    if ACTIVE_L.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_RIGHT, false, flags); }
+    if ACTIVE_U.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_HOME, false, flags); }
+    if ACTIVE_O.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_END, false, flags); }
+    if ACTIVE_H.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_UP, false, flags); }
+    if ACTIVE_N.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_DOWN, false, flags); }
+    if ACTIVE_BACK.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_FORWARD_DELETE, false, flags); }
+}
+
 unsafe fn post_simulated_arrow(target_arrow: u16, is_down: bool, base_flags: u64) {
     let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
     if !new_event.is_null() {
@@ -170,7 +237,7 @@ unsafe fn post_simulated_arrow(target_arrow: u16, is_down: bool, base_flags: u64
             K_CG_EVENT_SOURCE_USER_DATA,
             crate::common::INJECTED_SIGNATURE as i64,
         );
-        CGEventPost(0, new_event); // kCGHIDEventTap
+        CGEventPost(K_CG_HID_EVENT_TAP, new_event); // kCGHIDEventTap
         CFRelease(new_event);
     }
 }
@@ -196,33 +263,35 @@ unsafe extern "C" fn event_tap_callback(
         return event;
     }
 
-    // 3. CapsLock 状態変化の捕捉（物理的なキー押下・離脱フラグを追跡）
-    if event_type == K_CG_EVENT_FLAGS_CHANGED {
-        let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
-        if keycode == KEY_CAPSLOCK {
-            let flags = CGEventGetFlags(event);
-            let is_down = (flags & (NX_ALPHASHIFT_STATELESS_MASK | NX_DEVICE_ALPHASHIFT_STATELESS_MASK)) != 0;
-            CAPS_PRESSED.store(is_down, Ordering::SeqCst);
-            if !is_down {
-                // CapsLock 離脱時、残存しているナビゲーションキーがあれば安全に離脱(KEYUP)イベントを送信
-                if ACTIVE_I.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_UP, false, flags); }
-                if ACTIVE_J.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_LEFT, false, flags); }
-                if ACTIVE_K.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_DOWN, false, flags); }
-                if ACTIVE_L.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_RIGHT, false, flags); }
-                if ACTIVE_U.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_HOME, false, flags); }
-                if ACTIVE_O.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_END, false, flags); }
-                if ACTIVE_H.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_UP, false, flags); }
-                if ACTIVE_N.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_DOWN, false, flags); }
-                if ACTIVE_BACK.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_FORWARD_DELETE, false, flags); }
-            }
-            // CapsLock 自体の本来の大文字固定トグル動作は完全に無効化（イベント破棄）
-            return ptr::null_mut();
+    let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
+
+    // 3. Modifier (F18 / F19) 押下・離脱の捕捉
+    // hidutil リマップにより CapsLock は F18 (KeyDown / KeyUp) として発火する
+    if (event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP)
+        && (keycode == KEY_F18 || keycode == KEY_F19)
+    {
+        if event_type == K_CG_EVENT_KEY_DOWN {
+            CAPS_PRESSED.store(true, Ordering::SeqCst);
+        } else {
+            CAPS_PRESSED.store(false, Ordering::SeqCst);
+            release_all_active_keys(CGEventGetFlags(event));
         }
+        return ptr::null_mut(); // F18イベントを破棄して他アプリに渡さない
     }
 
-    // 4. ナビゲーションキー変換 (CapsLock押下中および押下中キーの安全解放)
+    // 生の CapsLock (flagsChanged) に対するフォールバック
+    if event_type == K_CG_EVENT_FLAGS_CHANGED && keycode == KEY_CAPSLOCK {
+        let flags = CGEventGetFlags(event);
+        let is_down = (flags & (K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT | NX_ALPHASHIFT_STATELESS_MASK | NX_DEVICE_ALPHASHIFT_STATELESS_MASK)) != 0;
+        CAPS_PRESSED.store(is_down, Ordering::SeqCst);
+        if !is_down {
+            release_all_active_keys(flags);
+        }
+        return ptr::null_mut(); // CapsLock 自体の本来の大文字固定トグル動作を破棄
+    }
+
+    // 4. ナビゲーションキー変換 (CapsLock / F18 押下中および押下中キーの安全解放)
     if event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP {
-        let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
         let allow_extended = crate::common::is_extended_enabled();
         if let Some(target_action) = macos_keycode_to_navigation(keycode, allow_extended) {
             if let Some(active_flag) = get_active_flag(keycode) {
@@ -297,6 +366,7 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn stop_hook() {
+    reset_capslock_remap();
     let loop_ptr = RUN_LOOP_PTR.load(Ordering::SeqCst);
     if !loop_ptr.is_null() {
         unsafe {
@@ -308,6 +378,16 @@ pub fn stop_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_trigger_key() {
+        assert!(is_trigger_key(KEY_F18));
+        assert!(is_trigger_key(KEY_F19));
+        assert!(is_trigger_key(KEY_CAPSLOCK));
+        assert!(!is_trigger_key(KEY_I));
+        assert!(!is_trigger_key(KEY_J));
+        assert!(!is_trigger_key(0));
+    }
 
     #[test]
     fn test_macos_keycode_to_arrow() {

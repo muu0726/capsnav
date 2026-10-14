@@ -70,6 +70,13 @@ pub fn ensure_capslock_off() {
     }
 }
 
+/// 有効化/無効化切り替え時のプラットフォーム固有フック
+pub fn on_enabled_changed(enabled: bool) {
+    if enabled {
+        ensure_capslock_off();
+    }
+}
+
 // ナビゲーションキーの Virtual Key Code
 pub const VK_I: u32 = 0x49;
 pub const VK_J: u32 = 0x4A;
