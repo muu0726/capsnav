@@ -32,6 +32,25 @@ pub const SCANCODE_CAPSLOCK: u32 = 0x3A;
 /// 日本語キーボードにおける「英数 (CapsLock)」キー単体押下時の仮想キーコード
 pub const VK_OEM_ATTN_CODE: u32 = 0xF0;
 
+/// 仮想修飾キー (F18〜F24) の仮想キーコード (macOSのF18リマップと完全統一)
+pub const VK_F18: VIRTUAL_KEY = VIRTUAL_KEY(0x81);
+pub const VK_F19: VIRTUAL_KEY = VIRTUAL_KEY(0x82);
+pub const VK_F20: VIRTUAL_KEY = VIRTUAL_KEY(0x83);
+pub const VK_F24: VIRTUAL_KEY = VIRTUAL_KEY(0x87);
+
+pub const VK_F18_CODE: u32 = 0x81;
+pub const VK_F19_CODE: u32 = 0x82;
+pub const VK_F20_CODE: u32 = 0x83;
+pub const VK_F24_CODE: u32 = 0x87;
+
+/// 入力キーがナビゲーション修飾トリガーキー（F18〜F24、CapsLock、英数キー）であるかを判定
+pub fn is_trigger_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
+    if vk_code == VK_F18_CODE || vk_code == VK_F19_CODE || vk_code == VK_F20_CODE || vk_code == VK_F24_CODE {
+        return true;
+    }
+    is_capslock_key(vk_code, scan_code, flags)
+}
+
 /// CapsLockキー（英語配列・日本語配列の英数キーを含む）であるかを判定する純粋関数
 pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
     // 仮想キーコードが VK_CAPITAL または VK_OEM_ATTN の場合は明示的なCapsLock/英数キー
@@ -46,7 +65,7 @@ pub fn is_capslock_key(vk_code: u32, scan_code: u32, flags: u32) -> bool {
 
 /// CapsLock状態を安全にリセットするための通常キー判定
 pub fn is_fallback_recovery_key(vk_code: u32) -> bool {
-    // 修飾キー（Shift, Ctrl, Alt, Win）および CapsLock 自体は除外
+    // 修飾キー（Shift, Ctrl, Alt, Win, CapsLock, F18..F24）は除外
     !matches!(
         vk_code,
         0x10 | 0xA0 | 0xA1 // Shift (VK_SHIFT, VK_LSHIFT, VK_RSHIFT)
@@ -54,6 +73,7 @@ pub fn is_fallback_recovery_key(vk_code: u32) -> bool {
         | 0x12 | 0xA4 | 0xA5 // Alt (VK_MENU, VK_LMENU, VK_RMENU)
         | 0x5B | 0x5C // Win (VK_LWIN, VK_RWIN)
         | 0x14 | 0xF0 // VK_CAPITAL, VK_OEM_ATTN
+        | 0x81 | 0x82 | 0x83 | 0x87 // VK_F18, VK_F19, VK_F20, VK_F24
     )
 }
 
@@ -120,6 +140,9 @@ static ACTIVE_H: AtomicBool = AtomicBool::new(false);
 static ACTIVE_N: AtomicBool = AtomicBool::new(false);
 static ACTIVE_BACK: AtomicBool = AtomicBool::new(false);
 
+/// 仮想修飾キー (F18) のシミュレート押下中フラグ
+static VIRTUAL_F18_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 fn get_active_flag(vk: u32) -> Option<&'static AtomicBool> {
     match vk {
         VK_I => Some(&ACTIVE_I),
@@ -138,6 +161,9 @@ fn get_active_flag(vk: u32) -> Option<&'static AtomicBool> {
 /// CapsLock解放時の状態リセットおよびシミュレート中キーの安全解放 (KeyUp送信)
 pub fn reset_caps_state() {
     CAPS_PRESSED.store(false, Ordering::SeqCst);
+    if VIRTUAL_F18_ACTIVE.swap(false, Ordering::SeqCst) {
+        send_simulated_key(VK_F18, true);
+    }
     if ACTIVE_I.swap(false, Ordering::SeqCst) { send_simulated_key(VK_UP, true); }
     if ACTIVE_J.swap(false, Ordering::SeqCst) { send_simulated_key(VK_LEFT, true); }
     if ACTIVE_K.swap(false, Ordering::SeqCst) { send_simulated_key(VK_DOWN, true); }
@@ -172,14 +198,20 @@ unsafe extern "system" fn low_level_keyboard_proc(
         let is_down = msg_type == WM_KEYDOWN || msg_type == WM_SYSKEYDOWN;
         let is_up = msg_type == WM_KEYUP || msg_type == WM_SYSKEYUP;
 
-        // 3. CapsLockの捕捉と完全遮断（OSの大文字トグル / LED点灯 / IME英数切り替えを完全に防止）
-        if is_capslock_key(kbd.vkCode, kbd.scanCode, kbd.flags.0) {
+        // 3. ナビゲーション修飾トリガーキー (CapsLock または 仮想修飾キー F18〜F24) の捕捉と処理
+        if is_trigger_key(kbd.vkCode, kbd.scanCode, kbd.flags.0) {
+            let is_physical_caps = is_capslock_key(kbd.vkCode, kbd.scanCode, kbd.flags.0);
             if is_down {
                 CAPS_PRESSED.store(true, Ordering::SeqCst);
+                // 物理 CapsLock の場合、OSの CapsLock トグルや LED 点灯を完全に遮断し、
+                // macOS と同様に仮想修飾キー (VK_F18 / Hyper key) に置き換えてシミュレート送信
+                if is_physical_caps && !VIRTUAL_F18_ACTIVE.swap(true, Ordering::SeqCst) {
+                    send_simulated_key(VK_F18, false);
+                }
             } else if is_up {
                 reset_caps_state();
             }
-            // LRESULT(1) を返すことで、OSおよび他アプリへのキー伝播を完全に遮断
+            // LRESULT(1) を返すことで、物理 CapsLock の OS への伝播を完全に遮断
             return LRESULT(1);
         }
 
@@ -437,6 +469,25 @@ mod tests {
         reset_caps_state();
         assert!(!CAPS_PRESSED.load(Ordering::SeqCst));
         assert!(!ACTIVE_I.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_is_trigger_key() {
+        // CapsLock / OEM_ATTN
+        assert!(is_trigger_key(VK_CAPITAL.0 as u32, SCANCODE_CAPSLOCK, 0));
+        assert!(is_trigger_key(VK_OEM_ATTN_CODE, SCANCODE_CAPSLOCK, 0));
+        assert!(is_trigger_key(0, SCANCODE_CAPSLOCK, 0));
+
+        // 仮想修飾キー (F18〜F24)
+        assert!(is_trigger_key(VK_F18_CODE, 0, 0));
+        assert!(is_trigger_key(VK_F19_CODE, 0, 0));
+        assert!(is_trigger_key(VK_F20_CODE, 0, 0));
+        assert!(is_trigger_key(VK_F24_CODE, 0, 0));
+
+        // 通常キーはトリガー外
+        assert!(!is_trigger_key(VK_I, 0x17, 0));
+        assert!(!is_trigger_key(0x41, 0, 0)); // 'A'
+        assert!(!is_trigger_key(0x20, 0, 0)); // Space
     }
 
     #[test]

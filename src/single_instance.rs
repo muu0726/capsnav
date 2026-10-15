@@ -104,35 +104,104 @@ impl Drop for ShowEventListener {
 }
 
 #[cfg(not(windows))]
-pub struct SingleInstanceGuard;
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(not(windows))]
+use std::path::PathBuf;
+#[cfg(not(windows))]
+use std::sync::Mutex;
+
+#[cfg(not(windows))]
+static PENDING_LISTENER: Mutex<Option<(String, UnixListener)>> = Mutex::new(None);
+
+#[cfg(not(windows))]
+fn get_socket_path(app_id: &str) -> PathBuf {
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
+    std::env::temp_dir().join(format!("{}_{}.sock", app_id, user))
+}
+
+#[cfg(not(windows))]
+pub struct SingleInstanceGuard {
+    socket_path: PathBuf,
+}
 
 #[cfg(not(windows))]
 impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+        if let Ok(mut lock) = PENDING_LISTENER.lock() {
+            *lock = None;
+        }
+    }
 }
 
 #[cfg(not(windows))]
-pub fn acquire_single_instance(_app_id: &str) -> Option<SingleInstanceGuard> {
-    Some(SingleInstanceGuard)
+pub fn acquire_single_instance(app_id: &str) -> Option<SingleInstanceGuard> {
+    let socket_path = get_socket_path(app_id);
+
+    // 既存のリスナーに接続可能かテスト
+    if UnixStream::connect(&socket_path).is_ok() {
+        log::warn!("既存のインスタンスが既に実行中です。二重起動を防止して終了します。");
+        return None;
+    }
+
+    // 接続できない場合、古い残存ソケットファイルがあれば削除して新規バインド
+    let _ = std::fs::remove_file(&socket_path);
+    match UnixListener::bind(&socket_path) {
+        Ok(listener) => {
+            log::info!("単一インスタンス ソケット ({:?}) を正常にバインドしました。", socket_path);
+            if let Ok(mut lock) = PENDING_LISTENER.lock() {
+                *lock = Some((app_id.to_string(), listener));
+            }
+            Some(SingleInstanceGuard { socket_path })
+        }
+        Err(e) => {
+            log::error!("単一インスタンス ソケットのバインドに失敗しました: {}", e);
+            None
+        }
+    }
 }
 
 #[cfg(not(windows))]
-pub fn signal_existing_instance(_app_id: &str) {}
+pub fn signal_existing_instance(app_id: &str) {
+    let socket_path = get_socket_path(app_id);
+    use std::io::Write;
+    if let Ok(mut stream) = UnixStream::connect(&socket_path) {
+        let _ = stream.write_all(b"show\n");
+        log::info!("既存インスタンスへ画面表示シグナルを送信しました。");
+    }
+}
 
 #[cfg(not(windows))]
-#[allow(dead_code)]
-pub struct ShowEventListener;
+pub struct ShowEventListener {
+    listener: UnixListener,
+}
 
 #[cfg(not(windows))]
-pub fn create_show_listener(_app_id: &str) -> Option<ShowEventListener> {
+pub fn create_show_listener(app_id: &str) -> Option<ShowEventListener> {
+    if let Ok(mut lock) = PENDING_LISTENER.lock() {
+        if let Some((stored_id, listener)) = lock.take() {
+            if stored_id == app_id {
+                return Some(ShowEventListener { listener });
+            } else {
+                *lock = Some((stored_id, listener));
+            }
+        }
+    }
     None
 }
 
 #[cfg(not(windows))]
-#[allow(dead_code)]
 impl ShowEventListener {
     pub fn wait_next(&self) -> bool {
-        false
+        match self.listener.accept() {
+            Ok((mut stream, _)) => {
+                use std::io::Read;
+                let mut buf = [0u8; 16];
+                let _ = stream.read(&mut buf);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -142,24 +211,37 @@ mod tests {
 
     #[test]
     fn test_single_instance_acquisition() {
-        let guard1 = acquire_single_instance("capsnav_unit_test");
+        let app_id = format!("capsnav_unit_test_{}", std::process::id());
+        let guard1 = acquire_single_instance(&app_id);
         assert!(guard1.is_some(), "最初のインスタンスは取得できる必要があります");
 
-        #[cfg(windows)]
-        {
-            let guard2 = acquire_single_instance("capsnav_unit_test");
-            assert!(guard2.is_none(), "2つ目のインスタンスはブロックされる必要があります");
-        }
+        let guard2 = acquire_single_instance(&app_id);
+        assert!(guard2.is_none(), "2つ目のインスタンスはブロックされる必要があります");
 
-        #[cfg(windows)]
         drop(guard1);
-        #[cfg(not(windows))]
-        let _ = guard1;
 
-        #[cfg(windows)]
-        {
-            let guard3 = acquire_single_instance("capsnav_unit_test");
-            assert!(guard3.is_some(), "解放後は再度取得できる必要があります");
-        }
+        let guard3 = acquire_single_instance(&app_id);
+        assert!(guard3.is_some(), "解放後は再度取得できる必要があります");
+    }
+
+    #[test]
+    fn test_single_instance_signal_flow() {
+        let app_id = format!("capsnav_signal_test_{}", std::process::id());
+        let guard = acquire_single_instance(&app_id);
+        assert!(guard.is_some());
+
+        let listener = create_show_listener(&app_id);
+        assert!(listener.is_some());
+        let listener = listener.unwrap();
+
+        let app_id_clone = app_id.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            signal_existing_instance(&app_id_clone);
+        });
+
+        assert!(listener.wait_next(), "シグナルを受信して wait_next が true を返す必要があります");
+        let _ = handle.join();
+        drop(guard);
     }
 }

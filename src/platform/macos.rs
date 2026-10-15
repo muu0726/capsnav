@@ -52,6 +52,10 @@ pub const K_CG_HID_EVENT_TAP: u32 = 0;
 pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 pub const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
+/// EventTap がシステム負荷やスリープ復帰により無効化された場合の通知イベント型
+pub const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFFFFFE;
+pub const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFFFFFF;
+
 /// CapsLock キー (HID: 0x700000039) を仮想キー F18 (HID: 0x70000006D, KeyCode: 79) へリマップ
 /// これにより、macOS の CapsLock 大文字固定トグル動作やLED点灯、入力ソース切り替え競合をハードウェア層で完全遮断し、
 /// 純粋なホールド型修飾キー (Hyperキー) として扱えるようにします。
@@ -112,6 +116,7 @@ pub fn is_trigger_key(keycode: i64) -> bool {
 
 static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
 static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -124,6 +129,7 @@ extern "C" {
         callback: unsafe extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef,
         refcon: *mut c_void,
     ) -> CFMachPortRef;
+    fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CFMachPortCreateRunLoopSource(
         allocator: CFAllocatorRef,
         port: CFMachPortRef,
@@ -145,6 +151,21 @@ extern "C" {
     fn CGEventPost(tap: u32, event: CGEventRef);
 
     static kCFRunLoopCommonModes: CFStringRef;
+}
+
+/// フォーカス喪失やKeyUp取りこぼし時にCapsLockホールド状態を安全解除するための通常キー判定
+pub fn is_fallback_recovery_key(keycode: i64) -> bool {
+    // 修飾キー（Command: 54/55, Shift: 56/60, Option: 58/61, Control: 59/62, CapsLock: 57, Fn: 63, F18: 79, F19: 80）は除外
+    !matches!(
+        keycode,
+        54 | 55 // Cmd
+        | 56 | 60 // Shift
+        | 58 | 61 // Option
+        | 59 | 62 // Control
+        | 57 // CapsLock
+        | 63 // Fn
+        | 79 | 80 // F18, F19
+    )
 }
 
 pub fn macos_keycode_to_navigation(keycode: i64, allow_extended: bool) -> Option<u16> {
@@ -248,6 +269,19 @@ unsafe extern "C" fn event_tap_callback(
     event: CGEventRef,
     _refcon: *mut c_void,
 ) -> CGEventRef {
+    // 0. EventTap がタイムアウトやユーザー入力により無効化された場合の自動復旧処理
+    if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT || event_type == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT {
+        let port = TAP_PORT.load(Ordering::SeqCst);
+        if !port.is_null() {
+            log::warn!(
+                "macOS EventTap が無効化されました (event_type: 0x{:X})。即時再有効化を実行します。",
+                event_type
+            );
+            CGEventTapEnable(port, true);
+        }
+        return event;
+    }
+
     if event.is_null() {
         return event;
     }
@@ -309,6 +343,16 @@ unsafe extern "C" fn event_tap_callback(
                     }
                 }
             }
+        } else if event_type == K_CG_EVENT_KEY_DOWN && is_fallback_recovery_key(keycode) {
+            // 5. フォールバック保護: ナビゲーション対象外の一般キーが押下された際、
+            // CapsLock状態の残留（フォーカス移動等によるKeyUp取りこぼし）があれば安全に解除
+            if CAPS_PRESSED.swap(false, Ordering::SeqCst) {
+                log::debug!(
+                    "通常キー (keycode: {}) 押下により CapsLock ホールド状態を安全解除",
+                    keycode
+                );
+                release_all_active_keys(CGEventGetFlags(event));
+            }
         }
     }
 
@@ -345,8 +389,11 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
             return Err("CGEventTapCreate の呼び出しに失敗しました。アクセシビリティ権限を確認してください。".into());
         }
 
+        TAP_PORT.store(port, Ordering::SeqCst);
+
         let run_loop_source = CFMachPortCreateRunLoopSource(ptr::null_mut(), port, 0);
         if run_loop_source.is_null() {
+            TAP_PORT.store(ptr::null_mut(), Ordering::SeqCst);
             CFRelease(port);
             return Err("CFMachPortCreateRunLoopSource の作成に失敗しました。".into());
         }
@@ -358,6 +405,7 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
         log::info!("macOS CGEventTap を開始しました (CapsLock + IJKL -> 矢印)");
         CFRunLoopRun();
 
+        TAP_PORT.store(ptr::null_mut(), Ordering::SeqCst);
         CFRelease(run_loop_source);
         CFRelease(port);
     }
@@ -367,6 +415,7 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn stop_hook() {
     reset_capslock_remap();
+    TAP_PORT.store(ptr::null_mut(), Ordering::SeqCst);
     let loop_ptr = RUN_LOOP_PTR.load(Ordering::SeqCst);
     if !loop_ptr.is_null() {
         unsafe {
@@ -472,5 +521,26 @@ mod tests {
         assert_eq!(K_CG_HID_EVENT_TAP, 0);
         assert_eq!(K_CG_HEAD_INSERT_EVENT_TAP, 0);
         assert_eq!(K_CG_EVENT_TAP_OPTION_DEFAULT, 0);
+        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT, 0xFFFFFFFE);
+        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn test_is_fallback_recovery_key() {
+        // 修飾キーはフォールバック解除キーと判定されないこと
+        assert!(!is_fallback_recovery_key(KEY_CAPSLOCK));
+        assert!(!is_fallback_recovery_key(KEY_F18));
+        assert!(!is_fallback_recovery_key(KEY_F19));
+        assert!(!is_fallback_recovery_key(55)); // Cmd
+        assert!(!is_fallback_recovery_key(56)); // Shift
+        assert!(!is_fallback_recovery_key(58)); // Option
+        assert!(!is_fallback_recovery_key(59)); // Control
+        assert!(!is_fallback_recovery_key(63)); // Fn
+
+        // 一般的な文字キー・操作キーはフォールバック解除キーと判定されること
+        assert!(is_fallback_recovery_key(0)); // 'A'
+        assert!(is_fallback_recovery_key(49)); // Space
+        assert!(is_fallback_recovery_key(36)); // Return
+        assert!(is_fallback_recovery_key(53)); // Escape
     }
 }

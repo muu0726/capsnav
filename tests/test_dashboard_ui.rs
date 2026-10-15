@@ -160,3 +160,30 @@ fn test_dashboard_testbox_textarea_attributes() {
     assert!(html.contains("<textarea class=\"test-box\" id=\"testBox\""));
     assert!(html.contains("spellcheck=\"false\""));
 }
+
+#[test]
+fn test_dashboard_esc_key_minimization() {
+    let html = get_dashboard_html();
+
+    // ESCキー押下時に最小化アクションが呼ばれるハンドラが存在すること
+    assert!(html.contains("e.key === 'Escape'"));
+    assert!(html.contains("action: 'minimize'"));
+}
+
+#[test]
+fn test_dashboard_realtime_key_mapping_elements() {
+    let html = get_dashboard_html();
+
+    // 押下状態のCSSスタイル
+    assert!(html.contains("kbd.pressed"));
+
+    // 各キーの data-key 属性が存在すること
+    let required_keys = ["u", "i", "o", "backspace", "h", "j", "k", "l", "n", "capslock"];
+    for key in required_keys {
+        assert!(
+            html.contains(&format!(r#"data-key="{}""#, key)),
+            "Missing data-key attribute for key: {}",
+            key
+        );
+    }
+}

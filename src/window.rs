@@ -401,6 +401,22 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       color: #b91c1c;
     }
 
+    /* リアルタイム押下フィードバック */
+    kbd.pressed {
+      background: #2563eb !important;
+      color: #ffffff !important;
+      border-color: #1d4ed8 !important;
+      border-bottom-color: #1e40af !important;
+      transform: translateY(1px);
+    }
+
+    kbd.caps.pressed {
+      background: #2563eb !important;
+      border-color: #1d4ed8 !important;
+      color: #ffffff !important;
+      transform: translateY(1px);
+    }
+
     /* 拡張機能無効時の減光 */
     .ext-disabled .ext-key {
       opacity: 0.35;
@@ -546,24 +562,24 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     <div class="section-title">Key Mapping Guide</div>
     <div class="keymap-container" id="keymapContainer">
       <div class="key-combo-header">
-        <kbd class="caps">CapsLock</kbd>
+        <kbd class="caps" id="kbdCaps" data-key="capslock">CapsLock</kbd>
         <span>+ キー入力で以下のナビゲーションが発動します:</span>
       </div>
       <div class="keys-showcase">
         <div class="key-row">
-          <div class="key-item ext-key" title="Home (行頭ジャンプ)"><kbd>U</kbd><span class="k-sub">Home</span></div>
-          <div class="key-item arrow-key" title="Up Arrow (↑)"><kbd>I</kbd><span class="k-sub">↑</span></div>
-          <div class="key-item ext-key" title="End (行末ジャンプ)"><kbd>O</kbd><span class="k-sub">End</span></div>
-          <div class="key-item ext-key del-key" title="Delete (前方削除)"><kbd>⌫</kbd><span class="k-sub">Del</span></div>
+          <div class="key-item ext-key" data-key="u" title="Home (行頭ジャンプ)"><kbd>U</kbd><span class="k-sub">Home</span></div>
+          <div class="key-item arrow-key" data-key="i" title="Up Arrow (↑)"><kbd>I</kbd><span class="k-sub">↑</span></div>
+          <div class="key-item ext-key" data-key="o" title="End (行末ジャンプ)"><kbd>O</kbd><span class="k-sub">End</span></div>
+          <div class="key-item ext-key del-key" data-key="backspace" title="Delete (前方削除)"><kbd>⌫</kbd><span class="k-sub">Del</span></div>
         </div>
         <div class="key-row">
-          <div class="key-item ext-key" title="PageUp (上スクロール)"><kbd>H</kbd><span class="k-sub">PgUp</span></div>
-          <div class="key-item arrow-key" title="Left Arrow (←)"><kbd>J</kbd><span class="k-sub">←</span></div>
-          <div class="key-item arrow-key" title="Down Arrow (↓)"><kbd>K</kbd><span class="k-sub">↓</span></div>
-          <div class="key-item arrow-key" title="Right Arrow (→)"><kbd>L</kbd><span class="k-sub">→</span></div>
+          <div class="key-item ext-key" data-key="h" title="PageUp (上スクロール)"><kbd>H</kbd><span class="k-sub">PgUp</span></div>
+          <div class="key-item arrow-key" data-key="j" title="Left Arrow (←)"><kbd>J</kbd><span class="k-sub">←</span></div>
+          <div class="key-item arrow-key" data-key="k" title="Down Arrow (↓)"><kbd>K</kbd><span class="k-sub">↓</span></div>
+          <div class="key-item arrow-key" data-key="l" title="Right Arrow (→)"><kbd>L</kbd><span class="k-sub">→</span></div>
         </div>
         <div class="key-row sub-row">
-          <div class="key-item ext-key" title="PageDown (下スクロール)"><kbd>N</kbd><span class="k-sub">PgDn</span></div>
+          <div class="key-item ext-key" data-key="n" title="PageDown (下スクロール)"><kbd>N</kbd><span class="k-sub">PgDn</span></div>
         </div>
       </div>
     </div>
@@ -614,7 +630,7 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   </div>
 
   <div class="footer-actions">
-    <button class="btn-minimize" id="btnMinimize">タスクトレイに最小化 (隠す)</button>
+    <button class="btn-minimize" id="btnMinimize">タスクトレイに最小化 (Esc)</button>
   </div>
 
   <script>
@@ -685,6 +701,48 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       if (window.ipc) {
         window.ipc.postMessage(JSON.stringify({ action: 'minimize' }));
       }
+    });
+
+    // キーマッピング要素の参照マップ
+    const keyElements = {
+      'KeyU': document.querySelector('[data-key="u"] kbd'),
+      'KeyI': document.querySelector('[data-key="i"] kbd'),
+      'KeyO': document.querySelector('[data-key="o"] kbd'),
+      'KeyH': document.querySelector('[data-key="h"] kbd'),
+      'KeyJ': document.querySelector('[data-key="j"] kbd'),
+      'KeyK': document.querySelector('[data-key="k"] kbd'),
+      'KeyL': document.querySelector('[data-key="l"] kbd'),
+      'KeyN': document.querySelector('[data-key="n"] kbd'),
+      'Backspace': document.querySelector('[data-key="backspace"] kbd'),
+      'CapsLock': document.getElementById('kbdCaps'),
+      'F18': document.getElementById('kbdCaps'),
+    };
+
+    // ESCキーでの最小化およびキー入力のリアルタイムハイライト
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (window.ipc) {
+          window.ipc.postMessage(JSON.stringify({ action: 'minimize' }));
+        }
+        return;
+      }
+      const el = keyElements[e.code] || keyElements[e.key];
+      if (el) {
+        el.classList.add('pressed');
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      const el = keyElements[e.code] || keyElements[e.key];
+      if (el) {
+        el.classList.remove('pressed');
+      }
+    });
+
+    window.addEventListener('blur', () => {
+      Object.values(keyElements).forEach(el => {
+        if (el) el.classList.remove('pressed');
+      });
     });
 
     // 起動時の初期状態要求
