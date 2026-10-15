@@ -69,19 +69,23 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   <title>capsnav</title>
   <style>
     :root {
-      --bg: #090d16;
-      --card-bg: rgba(22, 27, 46, 0.75);
-      --card-border: rgba(255, 255, 255, 0.08);
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --card-border: #e2e8f0;
+      --card-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --text-sub: #475569;
       --accent-green: #10b981;
-      --accent-green-glow: rgba(16, 185, 129, 0.25);
-      --accent-indigo: #6366f1;
-      --accent-indigo-glow: rgba(99, 102, 241, 0.25);
-      --accent-cyan: #06b6d4;
-      --accent-purple: #a855f7;
-      --kbd-bg: #1e293b;
-      --kbd-border: #334155;
+      --accent-green-light: #f0fdf4;
+      --accent-green-border: #bbf7d0;
+      --accent-blue: #2563eb;
+      --accent-blue-light: #eff6ff;
+      --accent-blue-border: #bfdbfe;
+      --kbd-bg: #ffffff;
+      --kbd-border: #cbd5e1;
+      --kbd-border-bottom: #94a3b8;
+      --kbd-text: #1e293b;
     }
 
     * {
@@ -94,7 +98,7 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-      background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg) 70%);
+      background: var(--bg);
       color: var(--text-main);
       padding: 20px 20px 16px;
       min-height: 100vh;
@@ -123,11 +127,10 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       width: 32px;
       height: 32px;
       border-radius: 8px;
-      background: linear-gradient(135deg, #6366f1, #3b82f6);
+      background: #0f172a;
       display: flex;
       align-items: center;
       justify-content: center;
-      box-shadow: 0 4px 12px var(--accent-indigo-glow);
     }
 
     .brand-icon svg {
@@ -140,9 +143,7 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       font-size: 19px;
       font-weight: 700;
       letter-spacing: -0.02em;
-      background: linear-gradient(135deg, #ffffff 40%, #a5b4fc);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
+      color: var(--text-main);
     }
 
     .version-badge {
@@ -150,37 +151,36 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       font-weight: 600;
       padding: 3px 8px;
       border-radius: 12px;
-      background: rgba(99, 102, 241, 0.15);
-      color: #a5b4fc;
-      border: 1px solid rgba(99, 102, 241, 0.3);
+      background: #f1f5f9;
+      color: var(--text-sub);
+      border: 1px solid var(--card-border);
     }
 
     /* カード基本スタイル */
     .card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 13px;
+      border-radius: 12px;
       padding: 14px 16px;
-      backdrop-filter: blur(12px);
-      transition: all 0.25s ease;
+      box-shadow: var(--card-shadow);
+      transition: border-color 0.2s ease, background-color 0.2s ease;
     }
 
-    /* メインスイッチカード (最重要) */
+    /* メインスイッチカード */
     .switch-card {
       display: flex;
       flex-direction: column;
       gap: 10px;
-      position: relative;
-      overflow: hidden;
     }
 
     .switch-card.active {
-      border-color: rgba(16, 185, 129, 0.4);
-      box-shadow: 0 0 24px var(--accent-green-glow);
+      border-color: var(--accent-green-border);
+      background: linear-gradient(180deg, #ffffff 0%, var(--accent-green-light) 100%);
     }
 
     .switch-card.inactive {
-      border-color: rgba(148, 163, 184, 0.2);
+      border-color: var(--card-border);
+      background: var(--card-bg);
     }
 
     .switch-header {
@@ -201,22 +201,22 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 8px;
+      color: var(--text-main);
     }
 
     .status-dot {
-      width: 9px;
-      height: 9px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
-      transition: all 0.3s ease;
+      transition: background-color 0.2s ease;
     }
 
     .active .status-dot {
       background: var(--accent-green);
-      box-shadow: 0 0 10px var(--accent-green);
     }
 
     .inactive .status-dot {
-      background: #64748b;
+      background: #94a3b8;
     }
 
     .switch-subtitle {
@@ -225,11 +225,11 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       line-height: 1.4;
     }
 
-    /* トグルスイッチデザイン */
+    /* トグルスイッチデザイン (iOS/macOSスタイル) */
     .toggle {
       position: relative;
-      width: 50px;
-      height: 27px;
+      width: 48px;
+      height: 26px;
       cursor: pointer;
       flex-shrink: 0;
     }
@@ -243,49 +243,48 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     .toggle-slider {
       position: absolute;
       top: 0; left: 0; right: 0; bottom: 0;
-      background: #334155;
-      border-radius: 27px;
-      transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: #cbd5e1;
+      border-radius: 26px;
+      transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
     .toggle-slider:before {
       position: absolute;
       content: "";
-      height: 19px;
-      width: 19px;
+      height: 20px;
+      width: 20px;
       left: 3px;
       bottom: 3px;
-      background: white;
+      background: #ffffff;
       border-radius: 50%;
-      transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+      transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
     }
 
     .toggle input:checked + .toggle-slider {
       background: var(--accent-green);
-      border-color: var(--accent-green);
-      box-shadow: 0 0 14px var(--accent-green-glow);
     }
 
     .toggle input:checked + .toggle-slider:before {
-      transform: translateX(23px);
+      transform: translateX(22px);
     }
 
     .switch-desc {
-      font-size: 11px;
-      color: #cbd5e1;
-      background: rgba(15, 23, 42, 0.6);
-      padding: 7px 10px;
-      border-radius: 7px;
+      font-size: 11.5px;
+      color: var(--text-sub);
+      background: #f8fafc;
+      padding: 8px 10px;
+      border-radius: 8px;
       border-left: 3px solid var(--accent-green);
       line-height: 1.45;
-      transition: all 0.25s ease;
+      border-top: 1px solid #f1f5f9;
+      border-right: 1px solid #f1f5f9;
+      border-bottom: 1px solid #f1f5f9;
     }
 
     .inactive .switch-desc {
-      border-left-color: #64748b;
-      color: #94a3b8;
+      border-left-color: #94a3b8;
+      color: var(--text-muted);
     }
 
     /* キーマップ図解 */
@@ -307,9 +306,10 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 10px;
-      background: rgba(15, 23, 42, 0.5);
+      background: #f8fafc;
       padding: 12px 14px;
       border-radius: 10px;
+      border: 1px solid var(--card-border);
     }
 
     .key-combo-header {
@@ -317,7 +317,7 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       align-items: center;
       gap: 8px;
       font-size: 12px;
-      color: var(--text-muted);
+      color: var(--text-sub);
     }
 
     .keys-showcase {
@@ -343,65 +343,68 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       flex-direction: column;
       align-items: center;
       gap: 3px;
-      transition: all 0.25s ease;
+      transition: opacity 0.2s ease;
     }
 
     .k-sub {
       font-size: 10px;
       font-weight: 600;
-      color: #94a3b8;
+      color: var(--text-muted);
     }
 
     kbd {
-      background: linear-gradient(180deg, #2d3748 0%, #1a202c 100%);
-      border: 1px solid #4a5568;
-      border-bottom: 2px solid #2d3748;
-      color: #f8fafc;
+      background: var(--kbd-bg);
+      border: 1px solid var(--kbd-border);
+      border-bottom: 2px solid var(--kbd-border-bottom);
+      color: var(--kbd-text);
       font-family: inherit;
       font-size: 12px;
       font-weight: 700;
       width: 32px;
       height: 30px;
       border-radius: 6px;
-      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      transition: all 0.25s ease;
+      transition: all 0.15s ease;
     }
 
     kbd.caps {
       width: auto;
       height: auto;
       padding: 4px 10px;
-      background: linear-gradient(180deg, #4338ca 0%, #312e81 100%);
-      border-color: #6366f1;
-      border-bottom-color: #3730a3;
-      color: #e0e7ff;
+      background: #0f172a;
+      border: 1px solid #0f172a;
+      border-bottom: 2px solid #000000;
+      color: #ffffff;
     }
 
     .arrow-key kbd {
-      background: linear-gradient(180deg, #1e3a5f 0%, #0f2744 100%);
-      border-color: #0284c7;
-      color: #38bdf8;
+      background: #eff6ff;
+      border-color: #bfdbfe;
+      border-bottom-color: #93c5fd;
+      color: #1d4ed8;
     }
 
     .ext-key kbd {
-      background: linear-gradient(180deg, #3b1d60 0%, #241240 100%);
-      border-color: #9333ea;
-      color: #c084fc;
+      background: #f5f3ff;
+      border-color: #ddd6fe;
+      border-bottom-color: #c4b5fd;
+      color: #6d28d9;
     }
 
     .del-key kbd {
-      background: linear-gradient(180deg, #581c1c 0%, #3b1010 100%);
-      border-color: #dc2626;
-      color: #f87171;
+      background: #fef2f2;
+      border-color: #fecaca;
+      border-bottom-color: #fca5a5;
+      color: #b91c1c;
     }
 
     /* 拡張機能無効時の減光 */
     .ext-disabled .ext-key {
-      opacity: 0.3;
-      filter: grayscale(0.8);
+      opacity: 0.35;
+      filter: grayscale(1);
     }
 
     /* お試しテスト入力エリア */
@@ -414,24 +417,24 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     .test-box {
       width: 100%;
       height: 76px;
-      background: rgba(15, 23, 42, 0.7);
+      background: #ffffff;
       border: 1px solid var(--card-border);
       border-radius: 9px;
-      color: #f1f5f9;
+      color: var(--text-main);
       font-family: inherit;
       font-size: 11.5px;
       padding: 8px 10px;
       resize: none;
       outline: none;
-      transition: all 0.2s ease;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
       user-select: text;
       -webkit-user-select: text;
       line-height: 1.45;
     }
 
     .test-box:focus {
-      border-color: var(--accent-indigo);
-      box-shadow: 0 0 12px var(--accent-indigo-glow);
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
     }
 
     /* 設定行 */
@@ -452,6 +455,7 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     .setting-title {
       font-size: 12.5px;
       font-weight: 600;
+      color: var(--text-main);
     }
 
     .setting-desc {
@@ -465,12 +469,12 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       display: flex;
       align-items: flex-start;
       gap: 8px;
-      background: rgba(99, 102, 241, 0.08);
-      border: 1px dashed rgba(99, 102, 241, 0.25);
-      padding: 8px 11px;
+      background: #f8fafc;
+      border: 1px solid var(--card-border);
+      padding: 9px 12px;
       border-radius: 8px;
-      font-size: 10.5px;
-      color: #c7d2fe;
+      font-size: 11px;
+      color: var(--text-sub);
       line-height: 1.4;
     }
 
@@ -481,20 +485,22 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     }
 
     .btn-minimize {
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      color: #cbd5e1;
+      background: #ffffff;
+      border: 1px solid var(--card-border);
+      color: var(--text-sub);
       padding: 6px 14px;
       border-radius: 7px;
       font-size: 11.5px;
       font-weight: 600;
       cursor: pointer;
-      transition: all 0.2s ease;
+      transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
     }
 
     .btn-minimize:hover {
-      background: rgba(255, 255, 255, 0.12);
-      color: #ffffff;
+      background: #f1f5f9;
+      color: var(--text-main);
+      border-color: #cbd5e1;
     }
   </style>
 </head>
