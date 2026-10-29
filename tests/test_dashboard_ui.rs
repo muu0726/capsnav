@@ -3,14 +3,21 @@
 use capsnav::window::get_dashboard_html;
 
 #[test]
-fn test_dashboard_version_injection() {
+fn test_dashboard_version_and_platform_placeholders_replaced() {
     let html = get_dashboard_html();
     let expected_version = format!("v{}", env!("CARGO_PKG_VERSION"));
 
-    // {{VERSION}} プレースホルダーが実バージョン番号に置換されていること
     assert!(
         !html.contains("{{VERSION}}"),
         "HTML template still contains unreplaced {{{{VERSION}}}} tag"
+    );
+    assert!(
+        !html.contains("{{FOOTER_NOTICE}}"),
+        "HTML template still contains unreplaced {{{{FOOTER_NOTICE}}}} tag"
+    );
+    assert!(
+        !html.contains("{{MINIMIZE_LABEL}}"),
+        "HTML template still contains unreplaced {{{{MINIMIZE_LABEL}}}} tag"
     );
     assert!(
         html.contains(&expected_version),
@@ -64,9 +71,13 @@ fn test_export_dashboard_html_for_browser_test() {
 "#;
     html = html.replace("</body>", &format!("{}\n</body>", hud));
 
-    std::fs::create_dir_all("scratch").expect("Failed to create scratch directory");
-    std::fs::write("scratch/dashboard_browser_test.html", html).expect("Failed to write test HTML");
-    assert!(std::path::Path::new("scratch/dashboard_browser_test.html").exists());
+    let out_path = std::env::temp_dir().join(format!(
+        "capsnav_dashboard_browser_test_{}.html",
+        std::process::id()
+    ));
+    std::fs::write(&out_path, html).expect("Failed to write test HTML");
+    assert!(out_path.exists());
+    let _ = std::fs::remove_file(&out_path);
 }
 
 #[test]
@@ -74,16 +85,16 @@ fn test_dashboard_required_dom_elements_exist() {
     let html = get_dashboard_html();
 
     let required_ids = [
-        "testBox",           // お試しテスト入力textarea
-        "enabledToggle",     // 機能全体トグル
-        "extendedToggle",    // 拡張ナビゲーション設定トグル
-        "startupToggle",     // 自動起動トグル
-        "mainCard",          // メインカード
-        "statusTitle",       // 状態タイトル表示
-        "statusSubtitle",    // 状態サブタイトル表示
-        "statusDesc",        // 状態説明表示
-        "keymapContainer",   // キーマップガイド枠
-        "btnMinimize",       // タスクトレイ最小化ボタン
+        "testBox",
+        "enabledToggle",
+        "extendedToggle",
+        "startupToggle",
+        "mainCard",
+        "statusTitle",
+        "statusSubtitle",
+        "statusDesc",
+        "keymapContainer",
+        "btnMinimize",
     ];
 
     for id in required_ids {
@@ -101,13 +112,13 @@ fn test_dashboard_required_css_classes_exist() {
     let html = get_dashboard_html();
 
     let required_classes = [
-        ".ext-disabled", // 拡張無効時の減光スタイル
-        ".arrow-key",    // 矢印キースタイル
-        ".ext-key",      // 拡張キースタイル
-        ".del-key",      // Deleteキースタイル
-        ".test-box",     // お試し入力テキストエリアスタイル
-        ".switch-card",  // スイッチカードスタイル
-        ".toggle-slider",// トグルスイッチスライダースタイル
+        ".ext-disabled",
+        ".arrow-key",
+        ".ext-key",
+        ".del-key",
+        ".test-box",
+        ".switch-card",
+        ".toggle-slider",
     ];
 
     for class_name in required_classes {
@@ -142,13 +153,16 @@ fn test_dashboard_ipc_actions_defined() {
 }
 
 #[test]
-fn test_dashboard_window_sync_state_function_defined() {
+fn test_dashboard_window_sync_functions_defined() {
     let html = get_dashboard_html();
 
-    // Rust側 (evaluate_script) から呼び出される window.syncState が定義されていること
     assert!(
         html.contains("window.syncState = function"),
         "Dashboard script is missing window.syncState function definition"
+    );
+    assert!(
+        html.contains("window.setCapsPressed = function"),
+        "Dashboard script is missing window.setCapsPressed function definition"
     );
 }
 
@@ -156,7 +170,6 @@ fn test_dashboard_window_sync_state_function_defined() {
 fn test_dashboard_testbox_textarea_attributes() {
     let html = get_dashboard_html();
 
-    // お試しテキストエリアがtextareaとして定義され、spellcheck="false" が設定されていること
     assert!(html.contains("<textarea class=\"test-box\" id=\"testBox\""));
     assert!(html.contains("spellcheck=\"false\""));
 }
@@ -165,25 +178,52 @@ fn test_dashboard_testbox_textarea_attributes() {
 fn test_dashboard_esc_key_minimization() {
     let html = get_dashboard_html();
 
-    // ESCキー押下時に最小化アクションが呼ばれるハンドラが存在すること
     assert!(html.contains("e.key === 'Escape'"));
     assert!(html.contains("action: 'minimize'"));
 }
 
 #[test]
-fn test_dashboard_realtime_key_mapping_elements() {
+fn test_dashboard_realtime_key_mapping_elements_and_remapped_keys() {
     let html = get_dashboard_html();
 
-    // 押下状態のCSSスタイル
     assert!(html.contains("kbd.pressed"));
 
-    // 各キーの data-key 属性が存在すること
-    let required_keys = ["u", "i", "o", "backspace", "h", "j", "k", "l", "n", "capslock"];
+    let required_keys = [
+        "u",
+        "i",
+        "o",
+        "backspace",
+        "h",
+        "j",
+        "k",
+        "l",
+        "n",
+        "capslock",
+    ];
     for key in required_keys {
         assert!(
             html.contains(&format!(r#"data-key="{}""#, key)),
             "Missing data-key attribute for key: {}",
             key
+        );
+    }
+
+    // ナビゲーション変換後のキーイベント名もハイライト対象として登録されていること
+    for mapped_code in [
+        "'ArrowUp'",
+        "'ArrowLeft'",
+        "'ArrowDown'",
+        "'ArrowRight'",
+        "'Home'",
+        "'End'",
+        "'PageUp'",
+        "'PageDown'",
+        "'Delete'",
+    ] {
+        assert!(
+            html.contains(mapped_code),
+            "Dashboard keyElements is missing remapped navigation code: {}",
+            mapped_code
         );
     }
 }

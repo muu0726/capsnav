@@ -13,12 +13,14 @@ pub struct DashboardWindow {
 impl DashboardWindow {
     pub fn new<T>(
         event_loop: &EventLoopWindowTarget<T>,
+        initial_visible: bool,
         ipc_handler: impl Fn(String) + 'static,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut builder = WindowBuilder::new()
             .with_title("capsnav")
             .with_inner_size(tao::dpi::LogicalSize::new(510.0, 750.0))
-            .with_resizable(false);
+            .with_resizable(false)
+            .with_visible(initial_visible);
 
         if let Ok(img) = image::load_from_memory(crate::tray::ICON_BYTES) {
             let rgba = img.to_rgba8();
@@ -29,6 +31,7 @@ impl DashboardWindow {
         }
 
         let window = builder.build(event_loop)?;
+        crate::common::set_dashboard_visible(initial_visible);
 
         let webview = WebViewBuilder::new()
             .with_html(get_dashboard_html())
@@ -41,9 +44,16 @@ impl DashboardWindow {
     }
 
     pub fn set_visible(&self, visible: bool) {
-        self.window.set_visible(visible);
+        crate::common::set_dashboard_visible(visible);
         if visible {
+            self.window.set_minimized(false);
+            self.window.set_visible(true);
+            self.window.set_always_on_top(true);
             self.window.set_focus();
+            self.window.set_always_on_top(false);
+        } else {
+            self.window.set_visible(false);
+            self.sync_caps_pressed(false);
         }
     }
 
@@ -54,11 +64,34 @@ impl DashboardWindow {
         );
         let _ = self.webview.evaluate_script(&script);
     }
+
+    pub fn sync_caps_pressed(&self, pressed: bool) {
+        let script = format!(
+            "if (window.setCapsPressed) {{ window.setCapsPressed({}); }}",
+            pressed
+        );
+        let _ = self.webview.evaluate_script(&script);
+    }
 }
 
 pub fn get_dashboard_html() -> String {
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    DASHBOARD_HTML_TEMPLATE.replace("{{VERSION}}", &version)
+    let (footer_notice, minimize_label) = if cfg!(target_os = "macos") {
+        (
+            "左上の [×] を閉じてもアプリは終了せず、画面上部のメニューバーに常駐します。終了はメニューバーアイコンの「capsnav を終了」から行えます。",
+            "メニューバーに隠す (Esc)",
+        )
+    } else {
+        (
+            "右上の [×] を閉じてもアプリは終了せず、タスクバー右下の通知領域（タスクトレイ）に常駐します。終了はトレイアイコン右クリックの「capsnav を終了」から行えます。",
+            "タスクトレイに最小化 (Esc)",
+        )
+    };
+
+    DASHBOARD_HTML_TEMPLATE
+        .replace("{{VERSION}}", &version)
+        .replace("{{FOOTER_NOTICE}}", footer_notice)
+        .replace("{{MINIMIZE_LABEL}}", minimize_label)
 }
 
 pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
@@ -626,11 +659,11 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   <!-- フッター常駐案内 -->
   <div class="footer-notice">
     <span>💡</span>
-    <span>右上の [×] を閉じてもアプリは終了せず、タスクバー右下の通知領域（タスクトレイ）に常駐します。終了はトレイアイコン右クリックの「capsnav を終了」から行えます。</span>
+    <span>{{FOOTER_NOTICE}}</span>
   </div>
 
   <div class="footer-actions">
-    <button class="btn-minimize" id="btnMinimize">タスクトレイに最小化 (Esc)</button>
+    <button class="btn-minimize" id="btnMinimize">{{MINIMIZE_LABEL}}</button>
   </div>
 
   <script>
@@ -703,7 +736,8 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       }
     });
 
-    // キーマッピング要素の参照マップ
+    // キーマッピング要素の参照マップ（物理キーおよび変換後のナビゲーションキー双方に対応）
+    const kbdCaps = document.getElementById('kbdCaps');
     const keyElements = {
       'KeyU': document.querySelector('[data-key="u"] kbd'),
       'KeyI': document.querySelector('[data-key="i"] kbd'),
@@ -714,9 +748,42 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       'KeyL': document.querySelector('[data-key="l"] kbd'),
       'KeyN': document.querySelector('[data-key="n"] kbd'),
       'Backspace': document.querySelector('[data-key="backspace"] kbd'),
-      'CapsLock': document.getElementById('kbdCaps'),
-      'F18': document.getElementById('kbdCaps'),
+      'Home': document.querySelector('[data-key="u"] kbd'),
+      'ArrowUp': document.querySelector('[data-key="i"] kbd'),
+      'End': document.querySelector('[data-key="o"] kbd'),
+      'PageUp': document.querySelector('[data-key="h"] kbd'),
+      'ArrowLeft': document.querySelector('[data-key="j"] kbd'),
+      'ArrowDown': document.querySelector('[data-key="k"] kbd'),
+      'ArrowRight': document.querySelector('[data-key="l"] kbd'),
+      'PageDown': document.querySelector('[data-key="n"] kbd'),
+      'Delete': document.querySelector('[data-key="backspace"] kbd'),
+      'CapsLock': kbdCaps,
+      'F18': kbdCaps,
     };
+
+    window.capsActive = false;
+    window.setCapsPressed = function(pressed) {
+      window.capsActive = !!pressed;
+      if (kbdCaps) {
+        kbdCaps.classList.toggle('pressed', window.capsActive);
+      }
+      if (!window.capsActive) {
+        Object.entries(keyElements).forEach(([k, el]) => {
+          if (el && el !== kbdCaps) el.classList.remove('pressed');
+        });
+      }
+    };
+
+    function resolveKeyElement(e) {
+      // macOS での行頭/行末ジャンプ (Cmd + ArrowLeft / ArrowRight) 判定
+      if (window.capsActive && e.metaKey && e.code === 'ArrowLeft') {
+        return keyElements['Home'];
+      }
+      if (window.capsActive && e.metaKey && e.code === 'ArrowRight') {
+        return keyElements['End'];
+      }
+      return keyElements[e.code] || keyElements[e.key];
+    }
 
     // ESCキーでの最小化およびキー入力のリアルタイムハイライト
     window.addEventListener('keydown', (e) => {
@@ -726,20 +793,29 @@ pub const DASHBOARD_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         }
         return;
       }
-      const el = keyElements[e.code] || keyElements[e.key];
+      if (e.metaKey && (e.code === 'ArrowLeft' || e.code === 'ArrowRight') && document.activeElement !== document.getElementById('testBox')) {
+        e.preventDefault();
+      }
+      const el = resolveKeyElement(e);
       if (el) {
         el.classList.add('pressed');
       }
     });
 
     window.addEventListener('keyup', (e) => {
-      const el = keyElements[e.code] || keyElements[e.key];
+      const el = resolveKeyElement(e);
       if (el) {
         el.classList.remove('pressed');
+      }
+      if (e.code === 'ArrowLeft') {
+        if (keyElements['Home']) keyElements['Home'].classList.remove('pressed');
+      } else if (e.code === 'ArrowRight') {
+        if (keyElements['End']) keyElements['End'].classList.remove('pressed');
       }
     });
 
     window.addEventListener('blur', () => {
+      window.capsActive = false;
       Object.values(keyElements).forEach(el => {
         if (el) el.classList.remove('pressed');
       });

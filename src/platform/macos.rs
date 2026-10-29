@@ -2,7 +2,14 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::sync::OnceLock;
+
+use crate::common::{
+    notify_caps_visual_state, AtomicNavState, NavAction, NavKeyUpResult, NavSlot,
+    INJECTED_SIGNATURE,
+};
 
 pub type CGEventRef = *mut c_void;
 pub type CGEventTapProxy = *mut c_void;
@@ -39,30 +46,142 @@ pub const K_CG_EVENT_KEY_DOWN: u32 = 10;
 pub const K_CG_EVENT_KEY_UP: u32 = 11;
 pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
 
+pub const K_CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
-#[allow(dead_code)]
 pub const K_CG_EVENT_SOURCE_USER_DATA: u32 = 42;
 
-pub const K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 0x00010000;
+pub const K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 0x0001_0000;
+pub const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
+pub const K_CG_EVENT_FLAG_MASK_CONTROL: u64 = 0x0004_0000;
+pub const K_CG_EVENT_FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
+pub const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
+pub const K_CG_EVENT_FLAG_MASK_NUMERIC_PAD: u64 = 0x0020_0000;
+pub const K_CG_EVENT_FLAG_MASK_SECONDARY_FN: u64 = 0x0080_0000;
+
+/// デバイス依存の左右修飾キーフラグマスク (L/R Ctrl, Shift, Cmd, Option)
+pub const NX_DEVICE_MODIFIER_MASK: u64 = 0x0000_207F;
+pub const NX_DEVICELCMDKEYMASK: u64 = 0x0000_0008;
+
+/// ユーザーが併用押下している修飾キー（Shift / Ctrl / Option / Cmd）を抽出するマスク
+pub const USER_MODIFIER_FLAGS_MASK: u64 = K_CG_EVENT_FLAG_MASK_SHIFT
+    | K_CG_EVENT_FLAG_MASK_CONTROL
+    | K_CG_EVENT_FLAG_MASK_ALTERNATE
+    | K_CG_EVENT_FLAG_MASK_COMMAND
+    | NX_DEVICE_MODIFIER_MASK;
+
 /// macOS IOKit / CoreGraphics における CapsLock の物理押下判定フラグ (stateless modifier)
-pub const NX_ALPHASHIFT_STATELESS_MASK: u64 = 0x01000000;
-pub const NX_DEVICE_ALPHASHIFT_STATELESS_MASK: u64 = 0x00000080;
+pub const NX_ALPHASHIFT_STATELESS_MASK: u64 = 0x0100_0000;
+pub const NX_DEVICE_ALPHASHIFT_STATELESS_MASK: u64 = 0x0000_0080;
 
 pub const K_CG_HID_EVENT_TAP: u32 = 0;
 pub const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 pub const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
 /// EventTap がシステム負荷やスリープ復帰により無効化された場合の通知イベント型
-pub const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFFFFFE;
-pub const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFFFFFF;
+pub const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+pub const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+
+/// HID Usage ID (Keyboard Page 0x07 << 32 | Usage)
+pub const HID_USAGE_CAPSLOCK: u64 = 0x0007_0000_0039;
+pub const HID_USAGE_F18: u64 = 0x0007_0000_006D;
+
+static NAV_STATE: AtomicNavState = AtomicNavState::new();
+static LAST_MODIFIER_FLAGS: AtomicU64 = AtomicU64::new(0);
+static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// 起動前にユーザーが設定していた他キーの `UserKeyMapping` を保持（リセット時に保護）
+static PRESERVED_USER_KEY_MAPPINGS: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+
+/// EventTap コールバックをブロックせずにバックグラウンドで `hidutil` 再適用を行うチャネル
+static REMAP_WORKER_TX: OnceLock<SyncSender<()>> = OnceLock::new();
+
+/// `hidutil property --get "UserKeyMapping"` の出力から既存の `(Src, Dst)` ペアを抽出（CapsLock 自身は除外）
+pub fn parse_hidutil_user_key_mappings(output: &str) -> Vec<(u64, u64)> {
+    let mut mappings = Vec::new();
+    let mut current_src: Option<u64> = None;
+    let mut current_dst: Option<u64> = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('{') {
+            current_src = None;
+            current_dst = None;
+        } else if let Some(rest) = line.strip_prefix("HIDKeyboardModifierMappingSrc") {
+            current_src = parse_hidutil_integer_field(rest);
+        } else if let Some(rest) = line.strip_prefix("HIDKeyboardModifierMappingDst") {
+            current_dst = parse_hidutil_integer_field(rest);
+        } else if line.starts_with('}') {
+            if let (Some(src), Some(dst)) = (current_src.take(), current_dst.take()) {
+                if src != HID_USAGE_CAPSLOCK && !mappings.contains(&(src, dst)) {
+                    mappings.push((src, dst));
+                }
+            }
+        }
+    }
+
+    mappings
+}
+
+fn parse_hidutil_integer_field(rest: &str) -> Option<u64> {
+    let val_str = rest
+        .trim()
+        .strip_prefix('=')
+        .or_else(|| rest.trim().strip_prefix(':'))?
+        .trim()
+        .trim_end_matches([';', ','])
+        .trim()
+        .trim_matches('"');
+
+    if let Some(hex) = val_str.strip_prefix("0x").or_else(|| val_str.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        val_str.parse::<u64>().ok()
+    }
+}
+
+/// 保持された既存マッピングと CapsLock->F18 設定から `hidutil --set` 用 JSON を生成
+pub fn build_hidutil_mapping_json(preserved: &[(u64, u64)], include_capslock: bool) -> String {
+    let mut entries = Vec::with_capacity(preserved.len() + usize::from(include_capslock));
+    for &(src, dst) in preserved {
+        entries.push(format!(
+            "{{\"HIDKeyboardModifierMappingSrc\":0x{:X},\"HIDKeyboardModifierMappingDst\":0x{:X}}}",
+            src, dst
+        ));
+    }
+    if include_capslock {
+        entries.push(format!(
+            "{{\"HIDKeyboardModifierMappingSrc\":0x{:X},\"HIDKeyboardModifierMappingDst\":0x{:X}}}",
+            HID_USAGE_CAPSLOCK, HID_USAGE_F18
+        ));
+    }
+    format!("{{\"UserKeyMapping\":[{}]}}", entries.join(","))
+}
+
+fn get_preserved_mappings() -> &'static [(u64, u64)] {
+    PRESERVED_USER_KEY_MAPPINGS
+        .get_or_init(|| {
+            match std::process::Command::new("hidutil")
+                .args(["property", "--get", "UserKeyMapping"])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    parse_hidutil_user_key_mappings(&text)
+                }
+                _ => Vec::new(),
+            }
+        })
+        .as_slice()
+}
 
 /// CapsLock キー (HID: 0x700000039) を仮想キー F18 (HID: 0x70000006D, KeyCode: 79) へリマップ
-/// これにより、macOS の CapsLock 大文字固定トグル動作やLED点灯、入力ソース切り替え競合をハードウェア層で完全遮断し、
-/// 純粋なホールド型修飾キー (Hyperキー) として扱えるようにします。
+/// 既存の他キーリマップを保持したまま、CapsLock トグル動作や LED 点灯をハードウェア層で完全遮断します。
 pub fn apply_capslock_remap() {
-    let mapping_json = r#"{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x700000039,"HIDKeyboardModifierMappingDst":0x70000006D}]}"#;
+    let preserved = get_preserved_mappings();
+    let mapping_json = build_hidutil_mapping_json(preserved, true);
     let status = std::process::Command::new("hidutil")
-        .args(["property", "--set", mapping_json])
+        .args(["property", "--set", &mapping_json])
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -77,14 +196,16 @@ pub fn apply_capslock_remap() {
     }
 }
 
-/// hidutil のキーリマップを初期状態（空）にリセット
+/// hidutil の CapsLock リマップを解除し、起動前の他キーリマップ状態へ復元
 pub fn reset_capslock_remap() {
+    let preserved = get_preserved_mappings();
+    let mapping_json = build_hidutil_mapping_json(preserved, false);
     let status = std::process::Command::new("hidutil")
-        .args(["property", "--set", "{\"UserKeyMapping\":[]}"])
+        .args(["property", "--set", &mapping_json])
         .status();
     match status {
         Ok(s) if s.success() => {
-            log::info!("hidutil によるキーリマップをリセットしました。");
+            log::info!("hidutil による CapsLock リマップを解除・復元しました。");
         }
         Ok(s) => {
             log::warn!("hidutil リマップのリセットが終了コード {:?} で終了しました。", s.code());
@@ -95,9 +216,44 @@ pub fn reset_capslock_remap() {
     }
 }
 
+fn schedule_async_remap_reapply() {
+    let tx = REMAP_WORKER_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let _ = std::thread::Builder::new()
+            .name("hidutil-reapply".to_string())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    if crate::common::is_enabled() && check_accessibility() {
+                        log::info!("新規/再接続キーボード検知: hidutil CapsLock->F18 リマップを再適用します。");
+                        apply_capslock_remap();
+                    }
+                }
+            });
+        tx
+    });
+    let _ = tx.try_send(());
+}
+
+/// 起動前の事前権限チェック（権限未付与時は hidutil を変更せず設定画面へ誘導して false を返す）
+pub fn preflight_check() -> bool {
+    if check_accessibility() {
+        return true;
+    }
+
+    open_accessibility_settings();
+    show_accessibility_dialog();
+
+    eprintln!("\n=======================================================");
+    eprintln!("[capsnav] capsnav の実行にはアクセシビリティ権限が必要です。『システム設定 > プライバシーとセキュリティ > アクセシビリティ』で capsnav を許可してください。");
+    eprintln!("=======================================================\n");
+    false
+}
+
 /// macOS 環境における CapsLock 状態のリセットおよび Hyperキーリマップ適用
 pub fn ensure_capslock_off() {
-    apply_capslock_remap();
+    if check_accessibility() && crate::common::is_enabled() {
+        apply_capslock_remap();
+    }
 }
 
 /// 有効化/無効化切り替え時のプラットフォーム固有フック
@@ -105,7 +261,22 @@ pub fn on_enabled_changed(enabled: bool) {
     if enabled {
         ensure_capslock_off();
     } else {
+        let released = NAV_STATE.reset_all();
+        notify_caps_visual_state(false);
+        unsafe {
+            release_actions(&released, LAST_MODIFIER_FLAGS.load(Ordering::Relaxed));
+        }
         reset_capslock_remap();
+    }
+}
+
+/// 拡張ナビゲーション切り替え時のプラットフォーム固有フック
+pub fn on_extended_changed(extended: bool) {
+    if !extended {
+        let released = NAV_STATE.on_extended_disabled();
+        unsafe {
+            release_actions(&released, LAST_MODIFIER_FLAGS.load(Ordering::Relaxed));
+        }
     }
 }
 
@@ -113,10 +284,6 @@ pub fn on_enabled_changed(enabled: bool) {
 pub fn is_trigger_key(keycode: i64) -> bool {
     keycode == KEY_F18 || keycode == KEY_F19 || keycode == KEY_CAPSLOCK
 }
-
-static CAPS_PRESSED: AtomicBool = AtomicBool::new(false);
-static RUN_LOOP_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -142,10 +309,8 @@ extern "C" {
     fn CFRelease(cf: *const c_void);
 
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
-    #[allow(dead_code)]
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventGetFlags(event: CGEventRef) -> u64;
-    #[allow(dead_code)]
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventCreateKeyboardEvent(source: *mut c_void, virtual_key: u16, key_down: bool) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
@@ -153,19 +318,45 @@ extern "C" {
     static kCFRunLoopCommonModes: CFStringRef;
 }
 
-/// フォーカス喪失やKeyUp取りこぼし時にCapsLockホールド状態を安全解除するための通常キー判定
-pub fn is_fallback_recovery_key(keycode: i64) -> bool {
-    // 修飾キー（Command: 54/55, Shift: 56/60, Option: 58/61, Control: 59/62, CapsLock: 57, Fn: 63, F18: 79, F19: 80）は除外
-    !matches!(
-        keycode,
-        54 | 55 // Cmd
-        | 56 | 60 // Shift
-        | 58 | 61 // Option
-        | 59 | 62 // Control
-        | 57 // CapsLock
-        | 63 // Fn
-        | 79 | 80 // F18, F19
-    )
+/// macOS 物理キーコードから共通 `NavSlot` への変換
+pub fn macos_keycode_to_slot(keycode: i64) -> Option<NavSlot> {
+    match keycode {
+        KEY_I => Some(NavSlot::I),
+        KEY_J => Some(NavSlot::J),
+        KEY_K => Some(NavSlot::K),
+        KEY_L => Some(NavSlot::L),
+        KEY_U => Some(NavSlot::U),
+        KEY_O => Some(NavSlot::O),
+        KEY_H => Some(NavSlot::H),
+        KEY_N => Some(NavSlot::N),
+        KEY_BACKSPACE => Some(NavSlot::Backspace),
+        _ => None,
+    }
+}
+
+/// `NavAction` と現在の修飾キーフラグから、macOS で送出すべき `(virtual_key, flags)` を導出する純粋関数
+///
+/// - 矢印キーには macOS 標準の `NumericPad | SecondaryFn` フラグを付与し、併用中の `Shift` / `Option` / `Cmd` / `Ctrl` を継承。
+/// - `Home` (`U`) / `End` (`O`) は Windows と同じく「現在行の行頭 / 行末への移動（Shift併用で行頭/行末選択）」となるよう、
+///   macOS 標準の `Cmd + Left Arrow` / `Cmd + Right Arrow` として生成。
+/// - `PageUp` / `PageDown` / `Delete` には `SecondaryFn` フラグを付与。
+pub fn nav_action_to_macos_key_spec(action: NavAction, base_flags: u64) -> (u16, u64) {
+    let user_mods = base_flags & USER_MODIFIER_FLAGS_MASK;
+    let arrow_flags = user_mods | K_CG_EVENT_FLAG_MASK_NUMERIC_PAD | K_CG_EVENT_FLAG_MASK_SECONDARY_FN;
+    let line_jump_flags = arrow_flags | K_CG_EVENT_FLAG_MASK_COMMAND | NX_DEVICELCMDKEYMASK;
+    let nav_cluster_flags = user_mods | K_CG_EVENT_FLAG_MASK_SECONDARY_FN;
+
+    match action {
+        NavAction::Up => (KEY_ARROW_UP, arrow_flags),
+        NavAction::Left => (KEY_ARROW_LEFT, arrow_flags),
+        NavAction::Down => (KEY_ARROW_DOWN, arrow_flags),
+        NavAction::Right => (KEY_ARROW_RIGHT, arrow_flags),
+        NavAction::Home => (KEY_ARROW_LEFT, line_jump_flags),
+        NavAction::End => (KEY_ARROW_RIGHT, line_jump_flags),
+        NavAction::PageUp => (KEY_PAGE_UP, nav_cluster_flags),
+        NavAction::PageDown => (KEY_PAGE_DOWN, nav_cluster_flags),
+        NavAction::Delete => (KEY_FORWARD_DELETE, nav_cluster_flags),
+    }
 }
 
 pub fn macos_keycode_to_navigation(keycode: i64, allow_extended: bool) -> Option<u16> {
@@ -208,57 +399,26 @@ pub fn show_accessibility_dialog() {
         .spawn();
 }
 
-static ACTIVE_I: AtomicBool = AtomicBool::new(false);
-static ACTIVE_J: AtomicBool = AtomicBool::new(false);
-static ACTIVE_K: AtomicBool = AtomicBool::new(false);
-static ACTIVE_L: AtomicBool = AtomicBool::new(false);
-static ACTIVE_U: AtomicBool = AtomicBool::new(false);
-static ACTIVE_O: AtomicBool = AtomicBool::new(false);
-static ACTIVE_H: AtomicBool = AtomicBool::new(false);
-static ACTIVE_N: AtomicBool = AtomicBool::new(false);
-static ACTIVE_BACK: AtomicBool = AtomicBool::new(false);
-
-fn get_active_flag(keycode: i64) -> Option<&'static AtomicBool> {
-    match keycode {
-        KEY_I => Some(&ACTIVE_I),
-        KEY_J => Some(&ACTIVE_J),
-        KEY_K => Some(&ACTIVE_K),
-        KEY_L => Some(&ACTIVE_L),
-        KEY_U => Some(&ACTIVE_U),
-        KEY_O => Some(&ACTIVE_O),
-        KEY_H => Some(&ACTIVE_H),
-        KEY_N => Some(&ACTIVE_N),
-        KEY_BACKSPACE => Some(&ACTIVE_BACK),
-        _ => None,
+unsafe fn release_actions(actions: &[NavAction], base_flags: u64) {
+    for &action in actions {
+        post_simulated_action(action, false, base_flags, 0);
     }
 }
 
-unsafe fn release_all_active_keys(flags: u64) {
-    if ACTIVE_I.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_UP, false, flags); }
-    if ACTIVE_J.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_LEFT, false, flags); }
-    if ACTIVE_K.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_DOWN, false, flags); }
-    if ACTIVE_L.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_ARROW_RIGHT, false, flags); }
-    if ACTIVE_U.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_HOME, false, flags); }
-    if ACTIVE_O.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_END, false, flags); }
-    if ACTIVE_H.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_UP, false, flags); }
-    if ACTIVE_N.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_PAGE_DOWN, false, flags); }
-    if ACTIVE_BACK.swap(false, Ordering::SeqCst) { post_simulated_arrow(KEY_FORWARD_DELETE, false, flags); }
-}
-
-unsafe fn post_simulated_arrow(target_arrow: u16, is_down: bool, base_flags: u64) {
-    let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_arrow, is_down);
+unsafe fn post_simulated_action(action: NavAction, is_down: bool, base_flags: u64, autorepeat: i64) {
+    let (target_vk, flags) = nav_action_to_macos_key_spec(action, base_flags);
+    let new_event = CGEventCreateKeyboardEvent(ptr::null_mut(), target_vk, is_down);
     if !new_event.is_null() {
-        let flags = base_flags
-            & !K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT
-            & !NX_ALPHASHIFT_STATELESS_MASK
-            & !NX_DEVICE_ALPHASHIFT_STATELESS_MASK;
         CGEventSetFlags(new_event, flags);
+        if is_down && autorepeat != 0 {
+            CGEventSetIntegerValueField(new_event, K_CG_KEYBOARD_EVENT_AUTOREPEAT, autorepeat);
+        }
         CGEventSetIntegerValueField(
             new_event,
             K_CG_EVENT_SOURCE_USER_DATA,
-            crate::common::INJECTED_SIGNATURE as i64,
+            INJECTED_SIGNATURE as i64,
         );
-        CGEventPost(K_CG_HID_EVENT_TAP, new_event); // kCGHIDEventTap
+        CGEventPost(K_CG_HID_EVENT_TAP, new_event);
         CFRelease(new_event);
     }
 }
@@ -269,12 +429,16 @@ unsafe extern "C" fn event_tap_callback(
     event: CGEventRef,
     _refcon: *mut c_void,
 ) -> CGEventRef {
-    // 0. EventTap がタイムアウトやユーザー入力により無効化された場合の自動復旧処理
+    // 0. EventTap がタイムアウトやユーザー入力により無効化された場合の自動復旧と残留状態リセット
     if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT || event_type == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT {
+        let released = NAV_STATE.reset_all();
+        notify_caps_visual_state(false);
+        release_actions(&released, LAST_MODIFIER_FLAGS.load(Ordering::Relaxed));
+
         let port = TAP_PORT.load(Ordering::SeqCst);
         if !port.is_null() {
             log::warn!(
-                "macOS EventTap が無効化されました (event_type: 0x{:X})。即時再有効化を実行します。",
+                "macOS EventTap が無効化されました (event_type: 0x{:X})。状態を安全解除し即時再有効化します。",
                 event_type
             );
             CGEventTapEnable(port, true);
@@ -286,9 +450,9 @@ unsafe extern "C" fn event_tap_callback(
         return event;
     }
 
-    // 1. ループ防止
+    // 1. 自己注入イベントの通過（無限ループ防止）
     let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
-    if user_data == crate::common::INJECTED_SIGNATURE as i64 {
+    if user_data == INJECTED_SIGNATURE as i64 {
         return event;
     }
 
@@ -297,61 +461,72 @@ unsafe extern "C" fn event_tap_callback(
         return event;
     }
 
+    let flags = CGEventGetFlags(event);
+    LAST_MODIFIER_FLAGS.store(flags, Ordering::Relaxed);
     let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE);
 
-    // 3. Modifier (F18 / F19) 押下・離脱の捕捉
-    // hidutil リマップにより CapsLock は F18 (KeyDown / KeyUp) として発火する
+    // 3. 仮想修飾トリガーキー (F18 / F19) 押下・離脱の捕捉
     if (event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP)
         && (keycode == KEY_F18 || keycode == KEY_F19)
     {
         if event_type == K_CG_EVENT_KEY_DOWN {
-            CAPS_PRESSED.store(true, Ordering::SeqCst);
+            if NAV_STATE.on_trigger_down() {
+                notify_caps_visual_state(true);
+            }
         } else {
-            CAPS_PRESSED.store(false, Ordering::SeqCst);
-            release_all_active_keys(CGEventGetFlags(event));
+            let (was_caps, released) = NAV_STATE.on_trigger_up();
+            if was_caps {
+                notify_caps_visual_state(false);
+            }
+            release_actions(&released, flags);
         }
         return ptr::null_mut(); // F18イベントを破棄して他アプリに渡さない
     }
 
-    // 生の CapsLock (flagsChanged) に対するフォールバック
+    // 生の CapsLock (flagsChanged) に対するフォールバック（Bluetooth/USBキーボード再接続時など）
     if event_type == K_CG_EVENT_FLAGS_CHANGED && keycode == KEY_CAPSLOCK {
-        let flags = CGEventGetFlags(event);
-        let is_down = (flags & (K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT | NX_ALPHASHIFT_STATELESS_MASK | NX_DEVICE_ALPHASHIFT_STATELESS_MASK)) != 0;
-        CAPS_PRESSED.store(is_down, Ordering::SeqCst);
-        if !is_down {
-            release_all_active_keys(flags);
+        // トグルロックビット (ALPHA_SHIFT) は離しても 1 のまま残るため使用せず、ステートレス物理押下ビットのみで判定
+        let stateless_down =
+            (flags & (NX_ALPHASHIFT_STATELESS_MASK | NX_DEVICE_ALPHASHIFT_STATELESS_MASK)) != 0;
+        if stateless_down {
+            if NAV_STATE.on_trigger_down() {
+                notify_caps_visual_state(true);
+            }
+        } else {
+            let (was_caps, released) = NAV_STATE.on_trigger_up();
+            if was_caps {
+                notify_caps_visual_state(false);
+            }
+            release_actions(&released, flags);
+            // 新規接続デバイスへ非同期で F18 リマップを再適用
+            schedule_async_remap_reapply();
         }
-        return ptr::null_mut(); // CapsLock 自体の本来の大文字固定トグル動作を破棄
+        return ptr::null_mut();
     }
 
-    // 4. ナビゲーションキー変換 (CapsLock / F18 押下中および押下中キーの安全解放)
+    // 4. ナビゲーションキー変換 (CapsLock / F18 ホールド中および押下中キーの確実な解放)
+    // ※ナビゲーション対象外の通常キー（Cmd+C や文字入力など）が押されてもホールド状態は維持する
     if event_type == K_CG_EVENT_KEY_DOWN || event_type == K_CG_EVENT_KEY_UP {
-        let allow_extended = crate::common::is_extended_enabled();
-        if let Some(target_action) = macos_keycode_to_navigation(keycode, allow_extended) {
-            if let Some(active_flag) = get_active_flag(keycode) {
-                if event_type == K_CG_EVENT_KEY_DOWN {
-                    if CAPS_PRESSED.load(Ordering::SeqCst) {
-                        active_flag.store(true, Ordering::SeqCst);
-                        post_simulated_arrow(target_action, true, CGEventGetFlags(event));
-                        return ptr::null_mut();
-                    }
-                } else if event_type == K_CG_EVENT_KEY_UP {
-                    // 既に変換キーとして押下されていた場合、CapsLockが先に離されていても確実に離脱(KEYUP)を送信
-                    if active_flag.swap(false, Ordering::SeqCst) {
-                        post_simulated_arrow(target_action, false, CGEventGetFlags(event));
-                        return ptr::null_mut();
-                    }
+        if let Some(slot) = macos_keycode_to_slot(keycode) {
+            if event_type == K_CG_EVENT_KEY_DOWN {
+                let allow_extended = crate::common::is_extended_enabled();
+                if let Some(action) = NAV_STATE.on_nav_key_down(slot, allow_extended) {
+                    let autorepeat =
+                        CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT);
+                    post_simulated_action(action, true, flags, autorepeat);
+                    return ptr::null_mut();
                 }
-            }
-        } else if event_type == K_CG_EVENT_KEY_DOWN && is_fallback_recovery_key(keycode) {
-            // 5. フォールバック保護: ナビゲーション対象外の一般キーが押下された際、
-            // CapsLock状態の残留（フォーカス移動等によるKeyUp取りこぼし）があれば安全に解除
-            if CAPS_PRESSED.swap(false, Ordering::SeqCst) {
-                log::debug!(
-                    "通常キー (keycode: {}) 押下により CapsLock ホールド状態を安全解除",
-                    keycode
-                );
-                release_all_active_keys(CGEventGetFlags(event));
+            } else {
+                match NAV_STATE.on_nav_key_up(slot) {
+                    NavKeyUpResult::Release(action) => {
+                        post_simulated_action(action, false, flags, 0);
+                        return ptr::null_mut();
+                    }
+                    NavKeyUpResult::SuppressOrphan => {
+                        return ptr::null_mut();
+                    }
+                    NavKeyUpResult::PassThrough => {}
+                }
             }
         }
     }
@@ -361,14 +536,7 @@ unsafe extern "C" fn event_tap_callback(
 
 pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
     if !check_accessibility() {
-        // 設定画面を自動で開いてユーザーを誘導し、ダイアログおよびメッセージを表示
-        open_accessibility_settings();
-        show_accessibility_dialog();
-
-        eprintln!("\n=======================================================");
-        eprintln!("[capsnav] capsnav の実行にはアクセシビリティ権限が必要です。『システム設定 > プライバシーとセキュリティ > アクセシビリティ』で capsnav を許可してください。");
-        eprintln!("=======================================================\n");
-        std::process::exit(1);
+        return Err("アクセシビリティ権限が付与されていません。".into());
     }
 
     unsafe {
@@ -414,9 +582,14 @@ pub fn run_hook() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn stop_hook() {
+    let released = NAV_STATE.reset_all();
+    notify_caps_visual_state(false);
+    unsafe {
+        release_actions(&released, LAST_MODIFIER_FLAGS.load(Ordering::Relaxed));
+    }
     reset_capslock_remap();
     TAP_PORT.store(ptr::null_mut(), Ordering::SeqCst);
-    let loop_ptr = RUN_LOOP_PTR.load(Ordering::SeqCst);
+    let loop_ptr = RUN_LOOP_PTR.swap(ptr::null_mut(), Ordering::SeqCst);
     if !loop_ptr.is_null() {
         unsafe {
             CFRunLoopStop(loop_ptr);
@@ -475,25 +648,77 @@ mod tests {
 
     #[test]
     fn test_stateless_masks() {
-        assert_eq!(NX_ALPHASHIFT_STATELESS_MASK, 0x01000000);
-        assert_eq!(NX_DEVICE_ALPHASHIFT_STATELESS_MASK, 0x00000080);
+        assert_eq!(NX_ALPHASHIFT_STATELESS_MASK, 0x0100_0000);
+        assert_eq!(NX_DEVICE_ALPHASHIFT_STATELESS_MASK, 0x0000_0080);
         assert_eq!(NX_ALPHASHIFT_STATELESS_MASK & NX_DEVICE_ALPHASHIFT_STATELESS_MASK, 0);
         assert_eq!(NX_ALPHASHIFT_STATELESS_MASK & K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT, 0);
     }
 
     #[test]
-    fn test_active_flags_macos() {
-        assert!(get_active_flag(KEY_I).is_some());
-        assert!(get_active_flag(KEY_J).is_some());
-        assert!(get_active_flag(KEY_K).is_some());
-        assert!(get_active_flag(KEY_L).is_some());
-        assert!(get_active_flag(KEY_U).is_some());
-        assert!(get_active_flag(KEY_O).is_some());
-        assert!(get_active_flag(KEY_H).is_some());
-        assert!(get_active_flag(KEY_N).is_some());
-        assert!(get_active_flag(KEY_BACKSPACE).is_some());
-        assert!(get_active_flag(KEY_CAPSLOCK).is_none());
-        assert!(get_active_flag(0).is_none());
+    fn test_macos_keycode_to_slot() {
+        assert_eq!(macos_keycode_to_slot(KEY_I), Some(NavSlot::I));
+        assert_eq!(macos_keycode_to_slot(KEY_J), Some(NavSlot::J));
+        assert_eq!(macos_keycode_to_slot(KEY_K), Some(NavSlot::K));
+        assert_eq!(macos_keycode_to_slot(KEY_L), Some(NavSlot::L));
+        assert_eq!(macos_keycode_to_slot(KEY_U), Some(NavSlot::U));
+        assert_eq!(macos_keycode_to_slot(KEY_O), Some(NavSlot::O));
+        assert_eq!(macos_keycode_to_slot(KEY_H), Some(NavSlot::H));
+        assert_eq!(macos_keycode_to_slot(KEY_N), Some(NavSlot::N));
+        assert_eq!(macos_keycode_to_slot(KEY_BACKSPACE), Some(NavSlot::Backspace));
+        assert_eq!(macos_keycode_to_slot(KEY_CAPSLOCK), None);
+        assert_eq!(macos_keycode_to_slot(0), None);
+    }
+
+    #[test]
+    fn test_nav_action_to_macos_key_spec_flags_and_line_jump() {
+        // 基本矢印キーには NumericPad | SecondaryFn が付与され、AlphaShift は除去されること
+        let raw_flags = K_CG_EVENT_FLAG_MASK_SHIFT | K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT;
+        let (vk_up, flags_up) = nav_action_to_macos_key_spec(NavAction::Up, raw_flags);
+        assert_eq!(vk_up, KEY_ARROW_UP);
+        assert_ne!(flags_up & K_CG_EVENT_FLAG_MASK_SHIFT, 0);
+        assert_ne!(flags_up & K_CG_EVENT_FLAG_MASK_NUMERIC_PAD, 0);
+        assert_ne!(flags_up & K_CG_EVENT_FLAG_MASK_SECONDARY_FN, 0);
+        assert_eq!(flags_up & K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT, 0);
+
+        // Home(U) / End(O) は行頭/行末ジャンプ (Cmd + Left / Right) として生成され Shift 範囲選択も維持されること
+        let (vk_home, flags_home) = nav_action_to_macos_key_spec(NavAction::Home, raw_flags);
+        assert_eq!(vk_home, KEY_ARROW_LEFT);
+        assert_ne!(flags_home & K_CG_EVENT_FLAG_MASK_COMMAND, 0);
+        assert_ne!(flags_home & K_CG_EVENT_FLAG_MASK_SHIFT, 0);
+        assert_ne!(flags_home & K_CG_EVENT_FLAG_MASK_NUMERIC_PAD, 0);
+
+        let (vk_end, flags_end) = nav_action_to_macos_key_spec(NavAction::End, 0);
+        assert_eq!(vk_end, KEY_ARROW_RIGHT);
+        assert_ne!(flags_end & K_CG_EVENT_FLAG_MASK_COMMAND, 0);
+        assert_eq!(flags_end & K_CG_EVENT_FLAG_MASK_SHIFT, 0);
+    }
+
+    #[test]
+    fn test_hidutil_user_key_mapping_preservation() {
+        let sample_output = r#"
+RegistryID  Key                   Value
+1000004d2   UserKeyMapping        (
+        {
+        HIDKeyboardModifierMappingDst = 30064771299;
+        HIDKeyboardModifierMappingSrc = 30064771296;
+    },
+        {
+        HIDKeyboardModifierMappingDst = 30064771181;
+        HIDKeyboardModifierMappingSrc = 30064771129;
+    }
+)
+"#;
+        let preserved = parse_hidutil_user_key_mappings(sample_output);
+        // CapsLock (30064771129 = 0x700000039) は除外され、ユーザーの他キー設定のみ保持されること
+        assert_eq!(preserved, vec![(30064771296, 30064771299)]);
+
+        let active_json = build_hidutil_mapping_json(&preserved, true);
+        assert!(active_json.contains("0x7000000E0"));
+        assert!(active_json.contains("0x700000039"));
+
+        let reset_json = build_hidutil_mapping_json(&preserved, false);
+        assert!(reset_json.contains("0x7000000E0"));
+        assert!(!reset_json.contains("0x700000039"));
     }
 
     #[test]
@@ -504,14 +729,12 @@ mod tests {
         assert_eq!(macos_keycode_to_navigation(KEY_N, true), Some(KEY_PAGE_DOWN));
         assert_eq!(macos_keycode_to_navigation(KEY_BACKSPACE, true), Some(KEY_FORWARD_DELETE));
 
-        // 拡張無効時
         assert_eq!(macos_keycode_to_navigation(KEY_U, false), None);
         assert_eq!(macos_keycode_to_navigation(KEY_O, false), None);
         assert_eq!(macos_keycode_to_navigation(KEY_H, false), None);
         assert_eq!(macos_keycode_to_navigation(KEY_N, false), None);
         assert_eq!(macos_keycode_to_navigation(KEY_BACKSPACE, false), None);
 
-        // 矢印キーは常に有効
         assert_eq!(macos_keycode_to_navigation(KEY_I, false), Some(KEY_ARROW_UP));
         assert_eq!(macos_keycode_to_navigation(KEY_I, true), Some(KEY_ARROW_UP));
     }
@@ -521,26 +744,7 @@ mod tests {
         assert_eq!(K_CG_HID_EVENT_TAP, 0);
         assert_eq!(K_CG_HEAD_INSERT_EVENT_TAP, 0);
         assert_eq!(K_CG_EVENT_TAP_OPTION_DEFAULT, 0);
-        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT, 0xFFFFFFFE);
-        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, 0xFFFFFFFF);
-    }
-
-    #[test]
-    fn test_is_fallback_recovery_key() {
-        // 修飾キーはフォールバック解除キーと判定されないこと
-        assert!(!is_fallback_recovery_key(KEY_CAPSLOCK));
-        assert!(!is_fallback_recovery_key(KEY_F18));
-        assert!(!is_fallback_recovery_key(KEY_F19));
-        assert!(!is_fallback_recovery_key(55)); // Cmd
-        assert!(!is_fallback_recovery_key(56)); // Shift
-        assert!(!is_fallback_recovery_key(58)); // Option
-        assert!(!is_fallback_recovery_key(59)); // Control
-        assert!(!is_fallback_recovery_key(63)); // Fn
-
-        // 一般的な文字キー・操作キーはフォールバック解除キーと判定されること
-        assert!(is_fallback_recovery_key(0)); // 'A'
-        assert!(is_fallback_recovery_key(49)); // Space
-        assert!(is_fallback_recovery_key(36)); // Return
-        assert!(is_fallback_recovery_key(53)); // Escape
+        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT, 0xFFFF_FFFE);
+        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, 0xFFFF_FFFF);
     }
 }

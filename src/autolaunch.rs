@@ -7,12 +7,19 @@ pub fn create_auto_launcher() -> Result<AutoLaunch, Box<dyn std::error::Error>> 
     let current_exe = std::env::current_exe()?;
     let path_str = current_exe.to_string_lossy().to_string();
 
-    let auto = AutoLaunchBuilder::new()
+    let mut builder = AutoLaunchBuilder::new();
+    builder
         .set_app_name("capsnav")
         .set_app_path(&path_str)
-        .set_args(&["--minimized"])
-        .build()?;
+        .set_args(&["--minimized"]);
 
+    // Windows では HKLM 書き込みによる権限ロックインを防ぐため CurrentUser (HKCU) に固定
+    #[cfg(windows)]
+    {
+        builder.set_windows_enable_mode(auto_launch::WindowsEnableMode::CurrentUser);
+    }
+
+    let auto = builder.build()?;
     Ok(auto)
 }
 

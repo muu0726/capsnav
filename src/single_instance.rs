@@ -33,6 +33,11 @@ pub fn acquire_single_instance(app_id: &str) -> Option<SingleInstanceGuard> {
 }
 
 #[cfg(windows)]
+impl SingleInstanceGuard {
+    pub fn cleanup(&self) {}
+}
+
+#[cfg(windows)]
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
         use windows::Win32::Foundation::CloseHandle;
@@ -111,7 +116,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[cfg(not(windows))]
-static PENDING_LISTENER: Mutex<Option<(String, UnixListener)>> = Mutex::new(None);
+static PENDING_LISTENERS: Mutex<Vec<(String, UnixListener)>> = Mutex::new(Vec::new());
 
 #[cfg(not(windows))]
 fn get_socket_path(app_id: &str) -> PathBuf {
@@ -121,16 +126,24 @@ fn get_socket_path(app_id: &str) -> PathBuf {
 
 #[cfg(not(windows))]
 pub struct SingleInstanceGuard {
+    app_id: String,
     socket_path: PathBuf,
+}
+
+#[cfg(not(windows))]
+impl SingleInstanceGuard {
+    pub fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+        if let Ok(mut lock) = PENDING_LISTENERS.lock() {
+            lock.retain(|(id, _)| id != &self.app_id);
+        }
+    }
 }
 
 #[cfg(not(windows))]
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
-        if let Ok(mut lock) = PENDING_LISTENER.lock() {
-            *lock = None;
-        }
+        self.cleanup();
     }
 }
 
@@ -149,10 +162,14 @@ pub fn acquire_single_instance(app_id: &str) -> Option<SingleInstanceGuard> {
     match UnixListener::bind(&socket_path) {
         Ok(listener) => {
             log::info!("単一インスタンス ソケット ({:?}) を正常にバインドしました。", socket_path);
-            if let Ok(mut lock) = PENDING_LISTENER.lock() {
-                *lock = Some((app_id.to_string(), listener));
+            if let Ok(mut lock) = PENDING_LISTENERS.lock() {
+                lock.retain(|(id, _)| id != app_id);
+                lock.push((app_id.to_string(), listener));
             }
-            Some(SingleInstanceGuard { socket_path })
+            Some(SingleInstanceGuard {
+                app_id: app_id.to_string(),
+                socket_path,
+            })
         }
         Err(e) => {
             log::error!("単一インスタンス ソケットのバインドに失敗しました: {}", e);
@@ -178,13 +195,10 @@ pub struct ShowEventListener {
 
 #[cfg(not(windows))]
 pub fn create_show_listener(app_id: &str) -> Option<ShowEventListener> {
-    if let Ok(mut lock) = PENDING_LISTENER.lock() {
-        if let Some((stored_id, listener)) = lock.take() {
-            if stored_id == app_id {
-                return Some(ShowEventListener { listener });
-            } else {
-                *lock = Some((stored_id, listener));
-            }
+    if let Ok(mut lock) = PENDING_LISTENERS.lock() {
+        if let Some(pos) = lock.iter().position(|(id, _)| id == app_id) {
+            let (_, listener) = lock.swap_remove(pos);
+            return Some(ShowEventListener { listener });
         }
     }
     None

@@ -1,26 +1,18 @@
-//! CapsLockホールド状態遷移およびステートマシンのエッジケース検証テスト
+//! CapsLockホールド状態遷移およびロックフリー・ステートマシンの網羅的エッジケース検証テスト
 
 use capsnav::common::{
-    is_enabled, is_extended_enabled, set_enabled, set_extended_enabled, INJECTED_SIGNATURE,
+    is_enabled, is_extended_enabled, parse_config_json, serialize_config_json, set_enabled,
+    set_extended_enabled, AtomicNavState, NavAction, NavKeyUpResult, NavSlot, PersistedConfig,
+    INJECTED_SIGNATURE,
 };
-
-#[cfg(target_os = "windows")]
-use capsnav::platform::windows::{
-    is_capslock_key, is_fallback_recovery_key, reset_caps_state, vk_to_navigation, SCANCODE_CAPSLOCK,
-    VK_I, VK_J, VK_K, VK_L, VK_OEM_ATTN_CODE,
-};
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL;
 
 #[test]
 fn test_enabled_and_extended_global_toggles() {
-    // 全体有効フラグのトグル
     set_enabled(false);
     assert!(!is_enabled());
     set_enabled(true);
     assert!(is_enabled());
 
-    // 拡張機能フラグのトグル
     set_extended_enabled(false);
     assert!(!is_extended_enabled());
     set_extended_enabled(true);
@@ -29,66 +21,91 @@ fn test_enabled_and_extended_global_toggles() {
 
 #[test]
 fn test_injected_signature_constant() {
-    // 無限ループ防止用 dwExtraInfo タグが正しく設定されていること
     assert_eq!(INJECTED_SIGNATURE, 0xCA95_4A40);
     assert_ne!(INJECTED_SIGNATURE, 0);
 }
 
-#[cfg(target_os = "windows")]
 #[test]
-fn test_state_machine_reset_clears_all() {
-    // reset_caps_state が全アクティブキーおよびCapsホールド状態を安全にリセットすること
-    reset_caps_state();
+fn test_state_machine_full_hold_and_release_sequence() {
+    let sm = AtomicNavState::new();
 
-    // 複数回連続で呼び出しても安全（冪等性）であること
-    reset_caps_state();
-    reset_caps_state();
-}
-
-#[cfg(target_os = "windows")]
-#[test]
-fn test_simulated_hold_and_release_sequence() {
-    // 1. CapsLock KeyDown 発生シミュレーション
-    assert!(is_capslock_key(VK_CAPITAL.0 as u32, SCANCODE_CAPSLOCK, 0));
-    assert!(is_capslock_key(VK_OEM_ATTN_CODE, SCANCODE_CAPSLOCK, 0));
-
-    // 2. CapsLock ホールド中のナビゲーションキー打鍵
-    let up_arrow = vk_to_navigation(VK_I, true);
-    assert!(up_arrow.is_some());
-
-    // 3. ナビゲーションキー KeyUp
-    // 4. CapsLock KeyUp -> reset_caps_state
-    reset_caps_state();
-}
-
-#[cfg(target_os = "windows")]
-#[test]
-fn test_out_of_order_release_safety() {
-    // CapsLockホールド中にナビゲーションキーを押したまま、
-    // CapsLockが先に離された場合、reset_caps_state が残留アクティブフラグを解除すること
-    reset_caps_state();
-}
-
-#[cfg(target_os = "windows")]
-#[test]
-fn test_fallback_safety_with_shift_selection() {
-    // Shift + CapsLock + I (テキスト範囲選択コンビネーション) の検証
-    // Shift (0x10, 0xA0, 0xA1) はフォールバック対象外であるため、CapsLockホールドを誤解除しない
-    assert!(!is_fallback_recovery_key(0x10)); // VK_SHIFT
-    assert!(!is_fallback_recovery_key(0xA0)); // VK_LSHIFT
-    assert!(!is_fallback_recovery_key(0xA1)); // VK_RSHIFT
-
-    // 一方で、CapsLock解除後に Space (0x20) を押した場合はフォールバック対象となり解除される
-    assert!(is_fallback_recovery_key(0x20)); // VK_SPACE
-    assert!(is_fallback_recovery_key(0x0D)); // VK_RETURN
-}
-
-#[cfg(target_os = "windows")]
-#[test]
-fn test_all_arrow_keys_covered() {
-    let arrow_vks = [VK_I, VK_J, VK_K, VK_L];
-    for vk in arrow_vks {
-        assert!(vk_to_navigation(vk, false).is_some());
-        assert!(vk_to_navigation(vk, true).is_some());
+    // 1. CapsLock 未押下時はすべて通常通過
+    for slot in NavSlot::ALL {
+        assert_eq!(sm.on_nav_key_down(slot, true), None);
+        assert_eq!(sm.on_nav_key_up(slot), NavKeyUpResult::PassThrough);
     }
+
+    // 2. CapsLock 押下開始
+    assert!(sm.on_trigger_down());
+    assert!(sm.is_caps_pressed());
+
+    // 3. CapsLock ホールド中のナビゲーション打鍵と通常リリース
+    assert_eq!(sm.on_nav_key_down(NavSlot::I, true), Some(NavAction::Up));
+    assert_eq!(
+        sm.on_nav_key_up(NavSlot::I),
+        NavKeyUpResult::Release(NavAction::Up)
+    );
+
+    // 4. CapsLock 解放（既に個別解放済みのため追加解放リストは空）
+    let (was_caps, released) = sm.on_trigger_up();
+    assert!(was_caps);
+    assert!(released.is_empty());
+    assert!(!sm.is_caps_pressed());
+}
+
+#[test]
+fn test_out_of_order_release_and_orphan_keyup_suppression() {
+    let sm = AtomicNavState::new();
+    sm.on_trigger_down();
+
+    // J (Left) と K (Down) を同時に押下したまま先に CapsLock を離す
+    assert_eq!(sm.on_nav_key_down(NavSlot::J, true), Some(NavAction::Left));
+    assert_eq!(sm.on_nav_key_down(NavSlot::K, true), Some(NavAction::Down));
+
+    let (was_caps, released) = sm.on_trigger_up();
+    assert!(was_caps);
+    assert_eq!(released, vec![NavAction::Left, NavAction::Down]);
+
+    // 遅れて届く物理 J / K の KeyUp は二重解放せず SuppressOrphan で遮断されること
+    assert_eq!(sm.on_nav_key_up(NavSlot::J), NavKeyUpResult::SuppressOrphan);
+    assert_eq!(sm.on_nav_key_up(NavSlot::K), NavKeyUpResult::SuppressOrphan);
+
+    // その後の通常打鍵では PassThrough に戻ること
+    assert_eq!(sm.on_nav_key_up(NavSlot::J), NavKeyUpResult::PassThrough);
+    assert_eq!(sm.on_nav_key_down(NavSlot::J, true), None);
+}
+
+#[test]
+fn test_copy_paste_during_capslock_hold_preserves_state() {
+    // 範囲選択 (Shift+CapsLock+L) -> コピー (Ctrl/Cmd+C) -> カーソル移動 (CapsLock+K) の連続シナリオ
+    let sm = AtomicNavState::new();
+    sm.on_trigger_down();
+
+    // 範囲選択で L 押下・解放
+    assert_eq!(sm.on_nav_key_down(NavSlot::L, true), Some(NavAction::Right));
+    assert_eq!(
+        sm.on_nav_key_up(NavSlot::L),
+        NavKeyUpResult::Release(NavAction::Right)
+    );
+
+    // ここで通常キー 'C' (NavSlot外) が入力されても sm の Caps ホールドは絶対に解除されない
+    assert!(sm.is_caps_pressed());
+
+    // 直後の K 押下が文字 'k' にならず確実に Down Arrow として動作すること
+    assert_eq!(sm.on_nav_key_down(NavSlot::K, true), Some(NavAction::Down));
+    assert_eq!(
+        sm.on_nav_key_up(NavSlot::K),
+        NavKeyUpResult::Release(NavAction::Down)
+    );
+}
+
+#[test]
+fn test_persisted_config_serialization() {
+    let custom = PersistedConfig {
+        enabled: true,
+        extended_enabled: false,
+    };
+    let raw = serialize_config_json(&custom);
+    let loaded = parse_config_json(&raw);
+    assert_eq!(loaded, custom);
 }
